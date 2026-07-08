@@ -1,0 +1,183 @@
+<customrecordtype scriptid="customrecord_giv_rebate_liq_work">
+  <recordname>GIV Rebate Liquidation Work</recordname>
+  <accesstype>NONENEEDED</accesstype>
+  <allowinlineediting>T</allowinlineediting>
+  <allowquickadd>F</allowquickadd>
+  <allowquicksearch>F</allowquicksearch>
+  <includename>F</includename>
+  <isinactive>F</isinactive>
+  <isordered>F</isordered>
+  <showcreationdate>F</showcreationdate>
+  <showcreationdateonlist>F</showcreationdateonlist>
+  <showid>T</showid>
+  <showlastmodified>T</showlastmodified>
+  <showlastmodifiedonlist>T</showlastmodifiedonlist>
+  <shownotes>F</shownotes>
+  <showowner>F</showowner>
+  <showowneronlist>F</showowneronlist>
+  <customrecordcustomfields>
+
+    <customrecordcustomfield scriptid="custrecord_giv_lw_customer">
+      <label>Customer</label>
+      <fieldtype>SELECT</fieldtype>
+      <selectrecordtype>-2</selectrecordtype>
+      <ismandatory>T</ismandatory>
+      <displaytype>NORMAL</displaytype>
+    </customrecordcustomfield>
+
+    <customrecordcustomfield scriptid="custrecord_giv_lw_agreement">
+      <label>Agreement</label>
+      <fieldtype>INTEGER</fieldtype>
+      <ismandatory>T</ismandatory>
+      <displaytype>NORMAL</displaytype>
+    </customrecordcustomfield>
+
+    <customrecordcustomfield scriptid="custrecord_giv_lw_source_invoice">
+      <label>Source Invoice</label>
+      <fieldtype>SELECT</fieldtype>
+      <selectrecordtype>-30</selectrecordtype>
+      <ismandatory>T</ismandatory>
+      <displaytype>NORMAL</displaytype>
+    </customrecordcustomfield>
+
+    <customrecordcustomfield scriptid="custrecord_giv_lw_source_accrual">
+      <label>Source Accrual</label>
+      <fieldtype>SELECT</fieldtype>
+      <selectrecordtype>-30</selectrecordtype>
+      <ismandatory>T</ismandatory>
+      <displaytype>NORMAL</displaytype>
+    </customrecordcustomfield>
+
+    <customrecordcustomfield scriptid="custrecord_giv_lw_source_item">
+      <label>Source Item</label>
+      <fieldtype>SELECT</fieldtype>
+      <selectrecordtype>-10</selectrecordtype>
+      <ismandatory>T</ismandatory>
+      <displaytype>NORMAL</displaytype>
+    </customrecordcustomfield>
+
+    <customrecordcustomfield scriptid="custrecord_giv_lw_invoice_to">
+      <label>Invoice To</label>
+      <fieldtype>SELECT</fieldtype>
+      <selectrecordtype>-30</selectrecordtype>
+      <ismandatory>F</ismandatory>
+      <displaytype>NORMAL</displaytype>
+    </customrecordcustomfield>
+
+    <customrecordcustomfield scriptid="custrecord_giv_lw_taxcode">
+      <label>Tax Code</label>
+      <fieldtype>SELECT</fieldtype>
+      <selectrecordtype>-128</selectrecordtype>
+      <ismandatory>F</ismandatory>
+      <displaytype>NORMAL</displaytype>
+    </customrecordcustomfield>
+
+    <customrecordcustomfield scriptid="custrecord_giv_lw_processed_tran">
+      <label>Processed Transaction</label>
+      <fieldtype>SELECT</fieldtype>
+      <selectrecordtype>-30</selectrecordtype>
+      <ismandatory>F</ismandatory>
+      <displaytype>NORMAL</displaytype>
+    </customrecordcustomfield>
+
+    <customrecordcustomfield scriptid="custrecord_giv_lw_settle_method">
+      <label>Settlement Method</label>
+      <fieldtype>TEXT</fieldtype>
+      <ismandatory>T</ismandatory>
+      <displaytype>NORMAL</displaytype>
+    </customrecordcustomfield>
+
+    <customrecordcustomfield scriptid="custrecord_giv_lw_scenario">
+      <label>Scenario</label>
+      <fieldtype>TEXT</fieldtype>
+      <ismandatory>T</ismandatory>
+      <displaytype>NORMAL</displaytype>
+    </customrecordcustomfield>
+
+    <customrecordcustomfield scriptid="custrecord_giv_lw_proc_status">
+      <label>Processing Status</label>
+      <fieldtype>TEXT</fieldtype>
+      <ismandatory>T</ismandatory>
+      <displaytype>NORMAL</displaytype>
+    </customrecordcustomfield>
+
+    <customrecordcustomfield scriptid="custrecord_giv_lw_created_from">
+      <label>Created From</label>
+      <fieldtype>TEXT</fieldtype>
+      <ismandatory>F</ismandatory>
+      <displaytype>NORMAL</displaytype>
+    </customrecordcustomfield>
+
+    <customrecordcustomfield scriptid="custrecord_giv_lw_csv_batch_id">
+      <label>CSV Batch ID</label>
+      <fieldtype>TEXT</fieldtype>
+      <ismandatory>F</ismandatory>
+      <displaytype>NORMAL</displaytype>
+    </customrecordcustomfield>
+
+    <customrecordcustomfield scriptid="custrecord_giv_lw_original_amt">
+      <label>Original Amount</label>
+      <fieldtype>FLOAT</fieldtype>
+      <ismandatory>T</ismandatory>
+      <displaytype>NORMAL</displaytype>
+    </customrecordcustomfield>
+
+    <customrecordcustomfield scriptid="custrecord_giv_lw_returns_amt">
+      <label>Related Returns Amount</label>
+      <fieldtype>FLOAT</fieldtype>
+      <ismandatory>F</ismandatory>
+      <displaytype>NORMAL</displaytype>
+    </customrecordcustomfield>
+
+    <customrecordcustomfield scriptid="custrecord_giv_lw_settled_amt">
+      <label>Settled Amount</label>
+      <fieldtype>FLOAT</fieldtype>
+      <ismandatory>F</ismandatory>
+      <displaytype>NORMAL</displaytype>
+    </customrecordcustomfield>
+
+    <customrecordcustomfield scriptid="custrecord_giv_lw_available_amt">
+      <label>Available Amount</label>
+      <fieldtype>FLOAT</fieldtype>
+      <ismandatory>T</ismandatory>
+      <displaytype>NORMAL</displaytype>
+    </customrecordcustomfield>
+
+    <customrecordcustomfield scriptid="custrecord_giv_lw_amt_to_settle">
+      <label>Amount to Settle</label>
+      <fieldtype>FLOAT</fieldtype>
+      <ismandatory>T</ismandatory>
+      <displaytype>NORMAL</displaytype>
+    </customrecordcustomfield>
+
+    <customrecordcustomfield scriptid="custrecord_giv_lw_apply_amount">
+      <label>Apply Amount</label>
+      <fieldtype>FLOAT</fieldtype>
+      <ismandatory>F</ismandatory>
+      <displaytype>NORMAL</displaytype>
+    </customrecordcustomfield>
+
+    <customrecordcustomfield scriptid="custrecord_giv_lw_tax_basis">
+      <label>Tax Basis</label>
+      <fieldtype>FLOAT</fieldtype>
+      <ismandatory>F</ismandatory>
+      <displaytype>NORMAL</displaytype>
+    </customrecordcustomfield>
+
+    <customrecordcustomfield scriptid="custrecord_giv_lw_excess_flag">
+      <label>Excess Collection Flag</label>
+      <fieldtype>CHECKBOX</fieldtype>
+      <ismandatory>F</ismandatory>
+      <defaultchecked>F</defaultchecked>
+      <displaytype>NORMAL</displaytype>
+    </customrecordcustomfield>
+
+    <customrecordcustomfield scriptid="custrecord_giv_lw_error_message">
+      <label>Error Message</label>
+      <fieldtype>TEXTAREA</fieldtype>
+      <ismandatory>F</ismandatory>
+      <displaytype>NORMAL</displaytype>
+    </customrecordcustomfield>
+
+  </customrecordcustomfields>
+</customrecordtype>

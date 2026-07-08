@@ -1,0 +1,14 @@
+<suitelet scriptid="customscript_giv_sl_rebate_status">
+  <name>GIV Rebate Processing Status</name>
+  <notifyadmins>F</notifyadmins>
+  <scriptfile>[/SuiteScripts/giv_rebate/suitelet/giv_sl_rebate_processing_status.js]</scriptfile>
+  <scriptdeployments>
+    <scriptdeployment scriptid="customdeploy_giv_sl_status">
+      <title>GIV Rebate Processing Status</title>
+      <isdeployed>T</isdeployed>
+      <loglevel>DEBUG</loglevel>
+      <runasrole>ADMINISTRATOR</runasrole>
+      <status>TESTING</status>
+    </scriptdeployment>
+  </scriptdeployments>
+</suitelet>

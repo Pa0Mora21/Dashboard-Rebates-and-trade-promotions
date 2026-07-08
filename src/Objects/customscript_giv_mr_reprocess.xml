@@ -1,0 +1,31 @@
+<mapreducescript scriptid="customscript_giv_mr_reprocess">
+  <name>GIV Rebate Reprocess MR</name>
+  <notifyadmins>F</notifyadmins>
+  <scriptfile>[/SuiteScripts/giv_rebate/mapreduce/giv_mr_rebate_reprocess.js]</scriptfile>
+  <scriptcustomfields>
+    <scriptcustomfield scriptid="custscript_giv_reproc_agreement">
+      <label>Agreement</label>
+      <fieldtype>INTEGER</fieldtype>
+      <ismandatory>F</ismandatory>
+    </scriptcustomfield>
+    <scriptcustomfield scriptid="custscript_giv_reproc_date_from">
+      <label>Date From</label>
+      <fieldtype>DATE</fieldtype>
+      <ismandatory>F</ismandatory>
+    </scriptcustomfield>
+    <scriptcustomfield scriptid="custscript_giv_reproc_date_to">
+      <label>Date To</label>
+      <fieldtype>DATE</fieldtype>
+      <ismandatory>F</ismandatory>
+    </scriptcustomfield>
+  </scriptcustomfields>
+  <scriptdeployments>
+    <scriptdeployment scriptid="customdeploy_giv_mr_reprocess">
+      <title>GIV Rebate Reprocess MR</title>
+      <isdeployed>T</isdeployed>
+      <loglevel>DEBUG</loglevel>
+      <runasrole>ADMINISTRATOR</runasrole>
+      <status>TESTING</status>
+    </scriptdeployment>
+  </scriptdeployments>
+</mapreducescript>

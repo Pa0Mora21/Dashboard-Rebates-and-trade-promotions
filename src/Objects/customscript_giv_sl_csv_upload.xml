@@ -1,0 +1,14 @@
+<suitelet scriptid="customscript_giv_sl_csv_upload">
+  <name>GIV Rebate CSV Upload</name>
+  <notifyadmins>F</notifyadmins>
+  <scriptfile>[/SuiteScripts/giv_rebate/suitelet/giv_sl_rebate_csv_upload.js]</scriptfile>
+  <scriptdeployments>
+    <scriptdeployment scriptid="customdeploy_giv_sl_csv_upload">
+      <title>GIV Rebate CSV Upload</title>
+      <isdeployed>T</isdeployed>
+      <loglevel>DEBUG</loglevel>
+      <runasrole>ADMINISTRATOR</runasrole>
+      <status>TESTING</status>
+    </scriptdeployment>
+  </scriptdeployments>
+</suitelet>

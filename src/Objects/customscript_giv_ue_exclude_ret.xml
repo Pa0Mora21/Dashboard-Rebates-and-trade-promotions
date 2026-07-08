@@ -1,0 +1,14 @@
+<usereventscript scriptid="customscript_giv_ue_exclude_ret">
+  <name>GIV Exclude Return Accruals</name>
+  <notifyadmins>F</notifyadmins>
+  <scriptfile>[/SuiteScripts/giv_rebate/userevent/giv_ue_exclude_return_accruals.js]</scriptfile>
+  <scriptdeployments>
+    <scriptdeployment scriptid="customdeploy_giv_ue_exclude_ret">
+      <isdeployed>T</isdeployed>
+      <loglevel>DEBUG</loglevel>
+      <runasrole>ADMINISTRATOR</runasrole>
+      <status>TESTING</status>
+      <recordtype>CREDITMEMO</recordtype>
+    </scriptdeployment>
+  </scriptdeployments>
+</usereventscript>

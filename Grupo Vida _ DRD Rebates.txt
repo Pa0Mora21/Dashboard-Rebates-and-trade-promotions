@@ -1,0 +1,554 @@
+﻿Descripción del Problema
+
+
+En el marco de la implementación de NetSuite bajo la metodología SuiteSuccess, Grupo Industrial Vida requiere optimizar el proceso operativo de liquidación de reembolsos comerciales (rappeles) utilizando el módulo nativo de Rebates and Trade Promotions.
+Actualmente, aunque el módulo estándar permite gestionar acuerdos comerciales, acumulaciones y liquidaciones, existen necesidades operativas adicionales relacionadas con la selección, agrupación y aplicación de dichos beneficios comerciales.
+Las principales necesidades identificadas son:
+1. Falta de una interfaz operativa para administrar liquidaciones: El proceso estándar requiere navegar entre diferentes transacciones y pantallas para identificar:
+   * Provisiones generadas
+   * Saldos disponibles
+   * Documentos pendientes
+   * Aplicación financiera
+El equipo financiero requiere una pantalla centralizada donde pueda visualizar:
+   * Reembolsos pendientes de liquidar
+   * Facturas relacionadas
+   * Montos disponibles
+   * Montos a aplicar
+2. Necesidad de selección múltiple y aplicación masiva: Actualmente no existe una interfaz que permita seleccionar múltiples registros de manera simultánea. El negocio requiere poder:
+   * Seleccionar varias facturas origen con saldo pendiente de rebate
+   * Seleccionar múltiples facturas destino
+   * Distribuir montos manualmente
+   * Ejecutar una liquidación consolidada
+   * Mantener el código de impuesto (programa fiscal) del artículo origen para utilizarlo en la línea de la nota de liquidación
+Esto es necesario debido a escenarios donde una liquidación puede involucrar:
+   * Múltiples facturas de origen
+   * Múltiples SKUs
+   * Múltiples documentos destino
+3. Necesidad de soportar diferentes escenarios comerciales: El proceso operativo requiere manejar diferentes formas de liquidación dependiendo del acuerdo comercial:
+   * Liquidaciones estándar uno a uno.
+   * Consolidación de varias provisiones en una sola nota de crédito.
+   * Liquidación por SKU/material específico.
+   * Casos donde existe cobro superior a la provisión disponible.
+Cada escenario requiere reglas diferentes de validación y generación documental.
+4. Aplicación automática de documentos financieros: Cuando la liquidación corresponde a Credit Memo, el negocio requiere que:
+   * La nota de crédito se genere
+   * Se aplique automáticamente contra las facturas seleccionadas
+   * El usuario no tenga que entrar posteriormente a la transacción y utilizar la subficha Apply manualmente.
+5. Manejo de liquidaciones mediante Vendor Bill: Existen acuerdos comerciales donde la liquidación no genera Credit Memo sino Vendor Bill. Para estos casos:
+   * No existe factura destino a aplicar
+   * Solamente debe procesarse la liquidación del rebate
+   * La interfaz debe cambiar su comportamiento dependiendo del método configurado
+6. Requerimiento de carga masiva mediante CSV: Debido al volumen operativo esperado, el negocio requiere una alternativa para cargar liquidaciones mediante archivo CSV. La carga debe permitir:
+   * Múltiples facturas origen
+   * Múltiples SKUs
+   * Montos específicos
+   * Facturas destino cuando aplique
+La información cargada deberá validarse antes de generar transacciones.
+7. Consideración de devoluciones de mercancía en liquidaciones: Actualmente, el cálculo de disponibilidad de rebate debe considerar que una venta original puede haber tenido devoluciones posteriores mediante Notas de Crédito de cliente.
+El monto disponible para liquidar no debe tomar únicamente el valor bruto de la factura origen, sino el valor neto después de considerar movimientos que disminuyen la venta original.
+
+
+Planteamiento de la Solución para el problema
+
+
+Se propone desarrollar una solución personalizada mediante SuiteScript que permita gestionar el proceso operativo de liquidación de rebates mediante una interfaz centralizada.
+
+
+La solución funcionará como una capa adicional sobre el módulo estándar Rebates and Trade Promotions, manteniendo la lógica nativa de generación de liquidaciones y agregando controles operativos para selección, validación y trazabilidad.
+
+
+Objetivo:
+Implementar una interfaz tipo Dashboard que permita al equipo financiero:
+* Consultar provisiones pendientes
+* Seleccionar montos a liquidar
+* Seleccionar facturas destino cuando aplique
+* Procesar liquidaciones parciales o completas
+* Generar Credit Memo con aplicación automática
+* Generar Vendor Bill cuando corresponda
+* Mantener historial detallado de cada operación
+Solución de Alto Nivel
+1. Proceso de ingreso al Suitelet
+Se desarrollará un Suitelet accesible desde el menú de NetSuite.
+Ruta propuesta: Gestión de Reembolsos > Panel de Liquidación de Rebates
+El usuario deberá contar con permisos para:
+* Ejecutar Suitelet
+* Consultar acuerdos de rebate
+* Consultar transacciones financieras
+* Crear Credit Memo
+* Crear Vendor Bill
+
+
+2. Interfaz principal
+La pantalla estará dividida en:
+Cabecera de filtros
+Permitirá seleccionar:
+* Cliente (multiselect para cubrir escenarios de Cliente-Subcliente)
+* Nombre de Acuerdo de Reembolso
+* Factura origen (multiselect para el escenario de liquidaciones consolidadas)
+* Artículo (en factura origen del reembolso)
+* Periodo: Fecha de inicio y finalización del acuerdo
+* Rango de fechas de factura origen de reembolso
+* Escenario de liquidación (Estándar, Consolidada, Específica, Cobro en exceso)
+Los campos de selección de facturas y clientes deberán soportar múltiples valores.
+3. Sublista izquierda — Reembolsos disponibles
+La primera sección mostrará las provisiones pendientes de liquidación.
+Información:
+* Acuerdo comercial
+* Factura origen
+* Artículo
+* Fecha
+* Provisión original
+* Liquidaciones realizadas
+* Saldo disponible (El sistema deberá calcular el saldo disponible considerando: provisión original menos liquidaciones previas menos devoluciones asociadas a la factura origen)
+* Selección (Check para liquidar esta transacción)
+* Monto a liquidar.
+Aclaración: El cálculo de devoluciones se realizará buscando exclusivamente Notas de Crédito que tengan como origen (campo Created From) una Autorización de Devolución (RMA) que a su vez nazca de la Factura Origen, o Notas de Crédito creadas directamente desde la Factura Origen. Solo se considerará la merma en cantidades y montos del artículo específico. 
+El usuario podrá:
+* Seleccionar una o varias líneas
+* Capturar monto parcial
+* Liquidar completamente el saldo disponible.
+Para prevenir duplicidad o concurrencia de datos, las provisiones mostradas en el Suitelet deben excluir los saldos que ya estén asociados a un registro GIV_REBATE_LIQ_WORK en estatus 'Capturado', 'Validado' o 'Procesando'. Adicionalmente, al intentar guardar, el script debe validar contra la base de datos en tiempo real que el saldo sigue disponible.
+4. Sublista derecha — Facturas destino
+Esta sección será utilizada únicamente cuando el método de liquidación sea Credit Memo.
+Mostrará:
+* Factura
+* Cliente
+* Fecha
+* Total
+* Saldo abierto
+* Selección
+* Monto a aplicar
+Validación dinámica
+El sistema validará:
+Monto total origen seleccionado = Monto total destino seleccionado
+El sistema validará que el 'Monto a liquidar total' coincida exactamente con la suma de los valores ingresados en la columna 'Monto a aplicar' de la sublista destino, independientemente de que el saldo abierto total de las facturas destino sea mayor.
+Excepto:
+Escenario de cobro en exceso.
+5. Generación de liquidación
+Al procesar: El sistema determinará el flujo según el método del liquidación que tenga seleccionado el acuerdo.
+Al presionar el botón 'Procesar', el Suitelet no generará las transacciones financieras en tiempo real. Su única función será crear los registros en la entidad GIV_REBATE_LIQ_WORK con estado 'Capturado'  y disparar un script Map/Reduce. El usuario será redirigido a una pantalla de 'Estado de Procesamiento' donde verá el avance asíncrono del lote.
+Credit Memo 
+Proceso:
+Provisión seleccionada > Settlement > Credit Memo > Aplicación automática contra facturas seleccionadas
+La nota deberá generarse ya aplicada.
+Vendor Bill
+Proceso:
+Provisión seleccionada > Settlement > Vendor Bill
+No solicitará facturas destino.
+6. Escenarios de Validación / Operación
+La solución deberá contemplar diferentes escenarios operativos para la liquidación de reembolsos comerciales, considerando el método de liquidación configurado en el acuerdo, reglas fiscales y necesidades operativas del negocio.
+Escenario 1 — Liquidación estándar uno a uno
+Descripción
+Corresponde al escenario donde una provisión generada por una factura origen se liquida contra una factura destino específica del mismo cliente, deberá soportar la selección de varias facturas en la misma liquidación, pero el procesamiento se haría por separado generando la Nota de Crédito correspondiente a cada factura y su importe devengado neto (Facturas menos Notas de crédito por devolución).
+Este escenario representa el flujo estándar donde existe una relación directa entre:
+* Reembolso generado
+* Documento financiero
+* Aplicación
+Ejemplo
+Reembolso disponible:
+Factura origen 
+	SKU
+	Saldo Disponible
+	FAC-10001 
+	Producto A 
+	$50,000
+	Factura destino:
+Factura
+	Saldo Abierto
+	FAC-20001 
+	$50,000
+	Proceso esperado
+Usuario selecciona:
+Origen:
+FAC-10001
+Monto:
+$50,000
+Destino:
+FAC-20001
+Monto:
+$50,000
+El sistema:
+1. Valida que coincidan los montos.
+2. Procesa liquidación.
+3. Genera Credit Memo.
+4. Aplica automáticamente el Credit Memo contra la factura seleccionada.
+Escenario 2 — Liquidación consolidada de múltiples facturas
+Descripción
+Permite agrupar múltiples provisiones provenientes de diferentes facturas origen para generar una sola liquidación.
+Este escenario será utilizado cuando comercialmente se requiera emitir un único documento financiero.
+Ejemplo
+Provisiones:
+Factura origen 
+	SKU
+	Saldo Disponible
+	FAC-10001 
+	Producto A 
+	$30,000 
+	FAC-10002 
+	Producto B 
+	$20,000 
+	FAC-10002 
+	Producto A
+	$50,000 
+	Facturas destino:
+Factura
+	Aplicación
+	FAC-90001 
+	$100,000
+	Proceso esperado
+El sistema generará:
+Un Credit Memo: $100,000
+Aplicación:
+FAC-90001 → $100,000
+La relación completa quedará registrada en el historial.
+Escenario 3 — Liquidación por SKU / material específico
+Descripción
+Permite liquidar únicamente determinados materiales dentro de una provisión acumulada.
+Aplica principalmente para:
+* Promociones específicas
+* Homologaciones
+* Acuerdos por producto
+* Marca propia
+Ejemplo
+Factura origen:
+FAC-30001
+Detalle:
+SKU
+	Provisión
+	Producto A 
+	$20,000 
+	Producto B 
+	$40,000 
+	Producto C
+	$15,000 
+	Usuario selecciona: Producto A por un monto de $10,000.
+Resultado:
+La liquidación considera únicamente el material seleccionado por el monto indicado y genera la nota de crédito aplicada a la factura seleccionada.
+Los demás montos permanecen disponibles.
+Escenario 4 — Liquidación con cobro en exceso
+Descripción
+Permite procesar casos donde el importe solicitado por negocio es superior al saldo disponible de provisión.
+Este escenario deberá existir debido a diferencias comerciales donde el cliente solicita recuperar importes adicionales que posteriormente serán regularizados.
+Ejemplo
+Saldo disponible: $100,000
+SKU
+	Provisión
+	Producto A 
+	$40,000 
+	Producto B 
+	$40,000 
+	Producto C
+	$20,000 
+	Monto solicitado: $120,000
+Regla
+Únicamente permitido cuando el Tipo de liquidación sea “Cobro en exceso”.
+Resultado:
+Credit Memo: $120,000
+Reversión de provisión: $100,000
+Diferencia: $20,000
+Tratamiento contable
+La diferencia no afecta la provisión, impacta resultados, se regularizará posteriormente conforme al proceso financiero definido de la creación de factura de venta manual cuando proceda la compensación/bonificación.
+Distribución del Monto Excedente (Prorrateo):
+Dado que no se utilizarán artículos adicionales para el monto en exceso, el sistema deberá distribuir (prorratear) la diferencia dinámicamente entre las líneas seleccionadas para liquidar. Esta distribución será ponderada, es decir, proporcional al peso que tiene cada línea sobre el total de la provisión seleccionada.
+La lógica de cálculo por línea para el Credit Memo será la siguiente:
+Monto Final Línea = Monto Provisión Línea + ((Monto Provisión Línea/Total Provisión Seleccionada)*Monto Excedente)
+Consideración técnica obligatoria (Manejo de Centavos): Al realizar divisiones para el prorrateo, es altamente probable que existan decimales infinitos. El script deberá redondear a 2 decimales por línea. Para asegurar que la sumatoria de las líneas cuadre exactamente con el "Monto solicitado" ingresado por el usuario, cualquier diferencia de centavos producida por el redondeo deberá sumarse o restarse automáticamente a la última línea de la Nota de Crédito.
+Escenario 5 — Liquidación mediante Vendor Bill
+Descripción:
+Aplica para acuerdos donde la liquidación del rebate se realiza mediante factura de proveedor.
+Flujo:
+Usuario selecciona: Provisiones pendientes.
+No selecciona: Facturas destino.
+Validación del Suitelet
+Si el método de liquidación del acuerdo es Vendor Bill:
+El sistema deberá:
+Deshabilitar:
+* Panel de facturas destino
+* Montos de aplicación
+* Validación de cuadre entre facturas origen y destino
+Resultado:
+Genera:
+Vendor Bill estándar.
+No genera:
+* Credit Memo
+* Aplicación contra facturas
+Escenario 6 — Carga masiva mediante CSV
+Descripción
+Permite cargar liquidaciones mediante archivo CSV para operaciones con alto volumen.
+Ejemplo layout
+
+
+Campo
+	Descripción
+	External ID
+	Indicador de cuáles líneas corresponden a una liquidación, ya sea estándar o de algún otro tipo.
+	Cliente
+	Cliente rebate
+	Agreement
+	Acuerdo de reembolso
+	Tipo de liquidación
+	Escenario de liquidación: Estándar, Consolidada, Específica, Cobro en exceso, Agrupación 
+	Factura Origen
+	Factura que genera la provisión
+	Artículo
+	Material que generó el reembolso
+	Monto a liquidar
+	Importe que se disminuirá de la provisión, sin sobrepasar el monto disponible por SKU, antes de impuestos.
+	Factura destino
+	Factura a la cual se realizará la aplicación de la nota de crédito cuando aplique.
+	Monto a aplicar
+	Monto de la nota que se aplicará a la factura, se ingresa acá el monto sin impuestos, pero la aplicación sería ya con el monto después de impuestos de acuerdo al Artículo del cual proviene el reembolso.
+	
+
+Proceso:
+CSV > Custom Recor Temporal > Validación > Procesamiento > Transacción financiera > Historial
+El procesamiento de CSV utilizará una regla de ejecución parcial (Partial Success). Si un registro (External ID) dentro del lote presenta un error, dicho registro quedará con estatus 'Error' y el detalle se guardará en custrecord_giv_liq_work_error_message. El resto de las líneas del lote que sean válidas continuarán su procesamiento hasta convertirse en 'Completado'.
+Escenario 7 — Exclusión Automática de Provisiones Negativas (Ej. Acuerdo Aniversario)
+Descripción
+Ciertos acuerdos comerciales (como promociones de Aniversario) aplican como beneficio exclusivo en la Factura de Venta y no deben ser mermados ni revertidos en caso de que el cliente realice una devolución de mercancía.
+Actualmente, el sistema nativo calcula la provisión negativa en las Notas de Crédito, requiriendo que el usuario desmarque manualmente la aplicación del acuerdo línea por línea, lo cual es inoperante.
+Regla de Negocio y Automatización
+El sistema deberá evaluar automáticamente si el acuerdo de reembolso asociado a la línea tiene marcado el check custrecord_giv_exclude_returns (Excluir de Provisiones por Devolución).
+Si el check es Verdadero (T):
+* Durante la creación de una Autorización de Devolución (RMA) o una Nota de Crédito (Credit Memo), el sistema intervendrá antes de guardar la transacción (User Event Script - Before Submit).
+* El script deberá desmarcar automáticamente el acuerdo de la sublista de "Ver Reembolsos Aplicables" para todas las líneas de artículos.
+* Resultado: La transacción se guardará sin generar ninguna provisión negativa (Accrual) para ese acuerdo específico. El usuario no tendrá que intervenir manualmente.
+Si el check es Falso (F):
+* El sistema mantendrá el comportamiento nativo, calculando y generando la provisión negativa correspondiente por la devolución.
+Escenario 8 — Utilería de Reprocesamiento Masivo de Provisiones (Cambios Retroactivos)
+Descripción del Escenario: Operativamente, existen casos donde las cadenas comerciales notifican cambios en las condiciones o porcentajes de los acuerdos de reembolso de manera retroactiva para el mes en curso. Al modificar el registro del Acuerdo de Reembolso (Rebate Agreement), NetSuite no actualiza automáticamente las provisiones (Accruals) de las facturas previamente emitidas en dicho mes.
+Planteamiento de la Solución: Para evitar que el usuario deba ingresar manualmente a editar y guardar decenas o cientos de facturas para que el sistema recalcule el nuevo monto, se desarrollará una utilería de reprocesamiento.
+Mecanismo Técnico: Se construirá un script asíncrono (Map/Reduce) que fungirá como motor de actualización.
+1. Filtros de Ejecución: El usuario podrá definir mediante parámetros (o una pequeña interfaz de disparo) el Acuerdo de Reembolso modificado y el Rango de Fechas (mes abierto).
+2. Procesamiento: El script buscará todas las Facturas de Venta dentro de ese rango de fechas asociadas a los clientes del acuerdo.
+3. Ejecución (Load/Save): El script realizará un record.load() y posteriormente un record.save() de cada factura encontrada, sin modificar ningún campo de negocio.
+4. Resultado: Esta acción técnica disparará de manera natural los scripts nativos del módulo de Rebates, forzando la actualización o creación de los Rebate Accruals con los nuevos porcentajes/montos del acuerdo vigente, asegurando la cuadratura del pasivo antes del cierre de mes.
+Escenario 9 — Agrupación comercial en una sola línea con desglose fiscal (Tax Details Override)
+Descripción
+El negocio requiere generar una Nota de Crédito que muestre una única línea de artículo consolidada (ej. "Descuento a Factura") por el monto total liquidado, para simplificar la vista del cliente. Sin embargo, a nivel fiscal (XML), este monto total puede estar compuesto por diferentes bases gravables y tasas de impuesto originadas por los SKUs liquidados (ej. una parte gravada al 0% y otra sujeta a IEPS del 8%).
+Ejemplo Operativo
+Provisiones a liquidar en una sola exhibición:
+* Provisión 1 | SKU A | Monto: $50.00 | Tratamiento: IVA 0%, Sin IEPS
+* Provisión 2 | SKU B | Monto: $50.00 | Tratamiento: IVA 0%, IEPS 8%
+* Monto Total a Liquidar: $100.00
+Regla de Negocio y Generación del Credit Memo (Tax Details Override) 
+Para lograr una sola línea comercial sin romper el timbrado fiscal, el script de creación del Credit Memo utilizará la funcionalidad nativa de Anulación de detalles de impuesto de NetSuite.
+El flujo técnico que deberá seguir el SuiteScript es el siguiente:
+1. Línea Comercial: Insertar una única línea en la sublista de artículos (item) utilizando el artículo genérico del Acuerdo de Reembolso por el importe neto total (ej. $100.00).
+2. Habilitar Override: Marcar como verdadero el campo de anulación de impuestos a nivel transacción (taxdetailsoverride).
+3. Inyección en Subregistro Fiscal: El script no dejará que NetSuite calcule el impuesto de la línea. En su lugar, interactuará con la sublista taxdetails para inyectar tantas líneas de impuesto como combinaciones fiscales existan en las provisiones de origen.
+Para el ejemplo operativo, el subregistro taxdetails quedará configurado por el script de la siguiente manera, apuntando a la única línea comercial (Reference ID):
+* Línea de Impuesto 1: Código de Impuesto (IVA 0%) | Base de Impuesto: $100.00 | Importe: $0.00
+* Línea de Impuesto 2: Código de Impuesto (IEPS 8%) | Base de Impuesto: $50.00 | Importe: $4.00
+Trazabilidad de la Liquidación
+Para que el motor Map/Reduce pueda calcular estas proporciones exactas al momento de generar el Credit Memo, los Custom Records (GIV_REBATE_LIQ_WORK y GIV_REBATE_LIQ_HISTORY) deberán almacenar invariablemente la base de impuesto y el código de impuesto heredado de cada provisión individual.
+Entidades (Custom Records) y relaciones
+El modelo de datos propuesto mantiene la utilización de las entidades estándar de NetSuite para la gestión de Rebates and Trade Promotions y agrega entidades personalizadas para controlar:
+* Preparación de liquidaciones
+* Validaciones
+* Procesamiento masivo
+* Trazabilidad financiera
+La solución no sustituye los registros estándar de NetSuite, sino que funciona como una capa de orquestación y auditoría.
+Entidades estándar involucradas
+1. Customer
+Tipo: Registro estándar
+Representa al cliente relacionado con el acuerdo comercial.
+Relaciones:
+Customer > Rebate Agreement > Invoice > Credit Memo
+Campos utilizados: Internal ID, Nombre, Subsidiaria y Moneda.
+2. Rebate Agreement
+Tipo: Registro estándar NetSuite Rebates
+Representa el acuerdo comercial que define las reglas del rebate.
+Relaciones:
+Customer > Rebate Agreement > Rebate Accrual > Rebate Settlement
+Campos utilizados: Método de liquidación, Cliente, Artículo, Periodo.
+Adición de Campo Custom:
+* Se deberá crear un nuevo campo tipo Checkbox en este registro nativo llamado custrecord_giv_exclude_returns (Etiqueta sugerida: Excluir de Provisiones por Devolución).
+* Propósito: Al marcarse, indicará al sistema (mediante script) que este acuerdo específico (ej. "Aniversario") no debe generar cálculos ni provisiones negativas cuando se generen Notas de Crédito o Autorizaciones de Devolución (RMA) provenientes de una factura.
+3. Rebate Accrual
+Tipo: Registro estándar
+Representa la provisión/devengo generado por ventas.
+Información utilizada: Factura origen, Artículo, Importe de devengo(Monto provisionado),  Importe de asiento de Reversal (Liquidación realizada), Devengo en Notas de Crédito por Devolución, Saldo Disponible.
+Regla:
+El saldo disponible será:
+Monto Provisionado - Liquidaciones realizadas - Provisión de Notas de Crédito por devolución relacionadas = Disponible
+4. Rebate Settlement
+Tipo: Registro estándar
+Representa la liquidación del rebate.
+Relación:
+Rebate agreement > Rebate Settlement > Credit Memo/Vendor Bill
+Uso:
+* Cerrar provisión
+* Generar documento financiero
+* Mantener comportamiento estándar
+Entidades Custom
+Para soportar la operación, trazabilidad y cargas masivas se crearán entidades personalizadas.
+Las transacciones principales continuarán utilizando objetos estándar de NetSuite:
+* Rebate Agreement
+* Rebate Accrual
+* Rebate Settlement
+* Credit Memo
+* Vendor Bill
+* Invoice
+Los Custom Records funcionarán como capa de control y auditoría. 
+Al no existir un flujo de aprobación financiera para estas liquidaciones, el cambio de estado en el campo custrecord_giv_liq_work_processing_status será estrictamente sistémico. Nacerá como Capturado, pasará a Procesando durante la ejecución del Map/Reduce, y terminará en Completado o Error. No se requiere intervención humana intermedia ni botones de aprobación. 
+1. GIV_REBATE_LIQ_WORK
+Propósito
+Este Custom Record funcionará como staging / capa intermedia para almacenar la información antes de generar la liquidación definitiva.
+Será utilizado para:
+* Selección manual desde Suitelet
+* Cargas CSV
+* Validaciones
+* Control de errores
+* Procesamiento mediante Map/Reduce.
+Este registro representa una intención de liquidación, no una liquidación final. 
+Campos sugeridos:
+* custrecord_giv_liq_work_customer (List/Record → Customer) [obligatorio]: Clientes a los que pertenece la aplicación.
+* custrecord_giv_liq_work_agreement (List/Record → Rebate Agreement) [obligatorio]: Acuerdo de reembolso seleccionado.
+* custrecord_giv_liq_work_settlement_method (List/Record → Método de liquidación) [obligatorio]: Informativo, se traerá del acuerdo de reembolso seleccionado para determinar cuál es el método de liquidación: Nota de crédito o Factura.
+* custrecord_giv_liq_work_scenario (List/Record) [obligatorio]: Tipo de escenario seleccionado para la liquidación de la lista: Estándar, Consolidada, Específica, Cobro en exceso.
+* custrecord_giv_liq_work_source_invoice (List/Record → Transaction: Invoice) [obligatorio]: Factura donde se provisionó el reembolso que se está liquidando.
+* custrecord_giv_liq_work_source_accrual (List/Record → Transaction: Accrual) [obligatorio]: Devengo donde se provisionó reembolso que se está liquidando.
+* custrecord_giv_liq_work_source_item (List/Record → Item) [obligatorio]: Artículo del que se está tomando la provisión para liquidar.
+* custrecord_giv_liq_work_original_amount (Currency) [obligatorio]: Monto originalmente provisionado para ese registro antes de las liquidaciones.
+* custrecord_giv_liq_work_related_returns_amount (Currency): Monto total del Accrual de las notas de crédito/devoluciones relacionadas a la factura origen para el artículo de esta línea.
+* custrecord_giv_liq_work_settled_amount (Currency): Monto liquidado a este momento de la provisión seleccionada.
+* custrecord_giv_liq_work_available_amount (Currency) [obligatorio]: Monto disponible del Artículo en esa factura, sería el monto provisionado (Accrual) menos lo que ya se ha liquidado previamente o los impactos negativos por nota de crédito de devolución de mercancía relacionadas a la factura origen.
+* custrecord_giv_liq_work_amount_to_settle (Currency) [obligatorio]: Monto que el usuario solicita liquidar en la operación actual, podría ser parcial.
+* custrecord_giv_liq_work_invoice_to (List/Record → Transaction: Invoice) : Factura abierta a la que se aplica la nota de crédito, solo aplicaría en reembolsos por Nota de Crédito, no en los que sean por Factura de proveedor.
+* custrecord_giv_liq_work_apply_amount (Currency): Monto que será aplicado específicamente contra la factura destino seleccionada.
+* custrecord_giv_liq_work_taxschedule (List/Record → Tax Schedule) : Programa fiscal relacionado al artículo que se timbró en la factura original.
+* custrecord_giv_liq_work_tax_basis (Currency): Porción del monto liquidado que sirve como base gravable para el cálculo del impuesto heredado. Este dato es vital para agrupar las bases en la pestaña de Detalles de Impuesto durante la consolidación.
+* custrecord_giv_liq_work_excess_collection_flag (Checkbox): Marca si el escenario es de monto superior para detectar si lo liquidado puede ser mayor a la provisión.
+* custrecord_giv_liq_work_csv_batch_id (Text): Identificador del archivo cargado cuando la información proviene de un CSV. Permite rastrear una carga completa.
+* custrecord_giv_liq_work_processing_status (List): Estado actual del registro: Capturado, Validado, Procesando, Completado, Error.
+* custrecord_giv_liq_work_error_message (Long Text): Guarda mensajes generados durante validaciones o errores del procesamiento.
+* custrecord_giv_liq_work_created_from (List): Indica si el registro nació del Suitelet manual o por importación de CSV.
+* custrecord_giv_liq_work_processed_transaction (List/Record → Transaction) [obligatorio]: Documento generado después del procesamiento (Credit Memo o Vendor Bill).
+2. GIV_REBATE_LIQ_HISTORY
+Propósito
+A diferencia de WORK, este registro no se modifica normalmente.
+Bitácora permanente que guarda la relación final entre:
+* Rebate
+* Liquidación
+* Documento financiero
+* Aplicación
+Campos sugeridos:
+* custrecord_giv_liq_history_customer (List/Record → Customer) [obligatorio]: Clientes relacionados a la liquidación.
+* custrecord_giv_liq_history_agreement (List/Record → Rebate Agreement) [obligatorio]: Acuerdo comercial del que proviene la liquidación.
+* custrecord_giv_liq_history_settlement (List/Record → Transaction: Settlement) [obligatorio]: Liquidación estándar realizada por NetSuite para cerrar la provisión.
+* custrecord_giv_liq_history_transaction_type (List → Método de liquidación)[obligatorio]: Método de liquidación relacionado al acuerdo: Credit Memo o Vendor Bill.
+* custrecord_giv_liq_history_generated_transaction (List/Record → Transaction): Transacción creada tras la liquidación ya sea Credit Memo o Vendor Bill.
+* custrecord_giv_liq_history_source_rebate_accrual (List/Record → Transaction: Accrual) [obligatorio]: Provisión o provisiones que fueron liquidadas.
+* custrecord_giv_liq_history_source_invoice (List/Record → Transaction: Invoice) : Factura original que generó el rebate.
+* custrecord_giv_liq_history_source_item (List/Record → Item): Artículo original de la factura asociado al rebate y por el cual se está haciendo la liquidación.
+* custrecord_giv_liq_history_invoiceto (List/Record → Transaction: Invoice): Factura a donde se aplicó el crédito cuando se trate de Credit Memo.
+* custrecord_giv_liq_history_scenario (List/Record) [obligatorio]: Tipo de escenario por el cual fue procesada la liquidación: Estándar, Consolidada, Específica, Cobro en exceso.
+* custrecord_giv_liq_history_source_accrual_amount (Currency) [obligatorio]: Informativo del monto original que se provisionó de ese artículo en esa factura para el acuerdo de reembolso seleccionado.
+* custrecord_giv_liq_history_source_settled_amount (Currency): Monto de la provisión que se liquida en esta transacción.
+* custrecord_giv_liq_history_source_return_credits_impact (Currency) : Monto de devoluciones de mercancía consideradas en la provisión y que no deberán entrar a liquidación.
+* custrecord_giv_liq_history_applied_amount (Currency): Monto aplicado a la factura (No aplica cuando la liquidación sea por Vendor Bill).
+* custrecord_giv_liq_history_difference (Currency) [obligatorio]: Diferencia entre lo provisionado disponible contra lo liquidado cuando sea el escenario de monto mayor.
+* custrecord_giv_history_taxschedule (List/Record → Tax Schedule): Programa fiscal con el que se procesó el monto en la Nota de Crédito que vendría heredado del artículo de la factura origen.
+* custrecord_giv_history_tax_basis (Currency): Porción del monto liquidado que sirve como base gravable para el cálculo del impuesto heredado. Este dato es vital para agrupar las bases en la pestaña de Detalles de Impuesto durante la consolidación.
+* custrecord_giv_history_csv_batch_id (Text): Identificador o referencia al archivo cargado cuando la información proviene de un CSV.
+* custrecord_giv_liq_history_user (List/Record → Employee) [obligatorio]: Usuario que realizó la liquidación.
+* custrecord_giv_liq_history_date (Date/Time) [obligatorio]: Fecha y hora en la que se realizó la liquidación.
+Relación entre ambos Custom Records
+GIV_REBATE_LIQ_WORK > *Procesamiento exitoso > GIV_REBATE_LIQ_HISTORY
+Ejemplo simplificado:
+WORK:
+* Cliente A
+* FAC-100
+* SKU X
+* $50,000
+* Estado: Completed
+Genera HISTORY:
+* Settlement #500
+* Credit Memo #700
+* Invoice aplicada #900
+* Usuario: Daniel
+* Fecha procesamiento: 01/06/2027
+El Custom Record GIV_REBATE_LIQ_WORK podría tener una vida transaccional temporal y podrá conservarse para auditoría técnica o depuración. El Custom Record GIV_REBATE_LIQ_HISTORY será considerado la fuente oficial de trazabilidad funcional de liquidaciones ejecutadas. 
+Configuración previa
+1. El módulo nativo NetSuite Rebates and Trade Promotions debe estar provisionado y habilitado en la cuenta.
+2. Los artículos, cuentas contables y clientes deben estar previamente configurados.
+3. Deben existir acuerdos de reembolso (Rebate Agreements) aprobados y activos, así como transacciones acumuladas (Accruals) para poder ser llamadas por el desarrollo.
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+ida | PMO: Mariano Carrillo   

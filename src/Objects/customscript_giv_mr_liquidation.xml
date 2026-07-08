@@ -1,0 +1,14 @@
+<mapreducescript scriptid="customscript_giv_mr_liquidation">
+  <name>GIV Rebate Liquidation MR</name>
+  <notifyadmins>F</notifyadmins>
+  <scriptfile>[/SuiteScripts/giv_rebate/mapreduce/giv_mr_rebate_liquidation.js]</scriptfile>
+  <scriptdeployments>
+    <scriptdeployment scriptid="customdeploy_giv_mr_liquidation">
+      <title>GIV Rebate Liquidation MR</title>
+      <isdeployed>T</isdeployed>
+      <loglevel>DEBUG</loglevel>
+      <runasrole>ADMINISTRATOR</runasrole>
+      <status>TESTING</status>
+    </scriptdeployment>
+  </scriptdeployments>
+</mapreducescript>

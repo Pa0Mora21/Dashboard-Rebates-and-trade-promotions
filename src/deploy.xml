@@ -1,0 +1,8 @@
+<deploy>
+  <objects>
+    <path>~/Objects/*</path>
+  </objects>
+  <files>
+    <path>~/FileCabinet/SuiteScripts/giv_rebate/*</path>
+  </files>
+</deploy>

@@ -1,0 +1,14 @@
+<suitelet scriptid="customscript_giv_sl_reprocess">
+  <name>GIV Rebate Reprocess</name>
+  <notifyadmins>F</notifyadmins>
+  <scriptfile>[/SuiteScripts/giv_rebate/suitelet/giv_sl_rebate_reprocess.js]</scriptfile>
+  <scriptdeployments>
+    <scriptdeployment scriptid="customdeploy_giv_sl_reprocess">
+      <title>GIV Rebate Reprocess</title>
+      <isdeployed>T</isdeployed>
+      <loglevel>DEBUG</loglevel>
+      <runasrole>ADMINISTRATOR</runasrole>
+      <status>TESTING</status>
+    </scriptdeployment>
+  </scriptdeployments>
+</suitelet>
