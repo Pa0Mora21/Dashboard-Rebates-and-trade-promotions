@@ -208,26 +208,44 @@ define([
             sublist.label = 'Provisiones Disponibles (' + accruals.length + ')';
 
             accruals.forEach((accrual, index) => {
-                sublist.setSublistValue({ id: 'custpage_src_select', line: index, value: 'F' });
-                sublist.setSublistValue({ id: 'custpage_src_agreement', line: index, value: accrual.agreementText || ' ' });
-                sublist.setSublistValue({ id: 'custpage_src_invoice', line: index, value: accrual.invoiceNumber || ' ' });
-                sublist.setSublistValue({ id: 'custpage_src_item', line: index, value: accrual.itemText || ' ' });
-                sublist.setSublistValue({ id: 'custpage_src_date', line: index, value: accrual.accrualDate || ' ' });
-                sublist.setSublistValue({ id: 'custpage_src_original', line: index, value: (accrual.accrualAmount || 0).toFixed(2) });
-                sublist.setSublistValue({ id: 'custpage_src_settled', line: index, value: (accrual.settledAmount || 0).toFixed(2) });
-                sublist.setSublistValue({ id: 'custpage_src_returns', line: index, value: (accrual.returnsAmount || 0).toFixed(2) });
-                sublist.setSublistValue({ id: 'custpage_src_locked', line: index, value: (accrual.lockedAmount || 0).toFixed(2) });
-                sublist.setSublistValue({ id: 'custpage_src_available', line: index, value: (accrual.availableAmount || 0).toFixed(2) });
-                sublist.setSublistValue({ id: 'custpage_src_currency', line: index, value: accrual.currencyText || ' ' });
+                // Función helper para valores seguros
+                const safeValue = (val, defaultVal = 'N/A') => {
+                    if (val === null || val === undefined || val === '') return defaultVal;
+                    return String(val);
+                };
+                
+                const safeNumber = (val) => {
+                    const num = parseFloat(val) || 0;
+                    return num.toFixed(2);
+                };
 
-                // Campos ocultos
-                sublist.setSublistValue({ id: 'custpage_src_accrual_id', line: index, value: accrual.accrualId });
-                sublist.setSublistValue({ id: 'custpage_src_agreement_id', line: index, value: accrual.agreementId || '' });
-                sublist.setSublistValue({ id: 'custpage_src_invoice_id', line: index, value: accrual.invoiceId || '' });
-                sublist.setSublistValue({ id: 'custpage_src_item_id', line: index, value: accrual.itemId || '' });
-                sublist.setSublistValue({ id: 'custpage_src_sett_method', line: index, value: accrual.settlementMethod || '' });
-                sublist.setSublistValue({ id: 'custpage_src_payer_id', line: index, value: accrual.payerId || '' });
-                sublist.setSublistValue({ id: 'custpage_src_acct_item', line: index, value: accrual.accountingItem || '' });
+                try {
+                    sublist.setSublistValue({ id: 'custpage_src_select', line: index, value: 'F' });
+                    sublist.setSublistValue({ id: 'custpage_src_agreement', line: index, value: safeValue(accrual.agreementText, 'Sin nombre') });
+                    sublist.setSublistValue({ id: 'custpage_src_invoice', line: index, value: safeValue(accrual.invoiceNumber) });
+                    sublist.setSublistValue({ id: 'custpage_src_item', line: index, value: safeValue(accrual.itemText) });
+                    sublist.setSublistValue({ id: 'custpage_src_date', line: index, value: safeValue(accrual.accrualDate) });
+                    sublist.setSublistValue({ id: 'custpage_src_original', line: index, value: safeNumber(accrual.accrualAmount) });
+                    sublist.setSublistValue({ id: 'custpage_src_settled', line: index, value: safeNumber(accrual.settledAmount) });
+                    sublist.setSublistValue({ id: 'custpage_src_returns', line: index, value: safeNumber(accrual.returnsAmount) });
+                    sublist.setSublistValue({ id: 'custpage_src_locked', line: index, value: safeNumber(accrual.lockedAmount) });
+                    sublist.setSublistValue({ id: 'custpage_src_available', line: index, value: safeNumber(accrual.availableAmount) });
+                    sublist.setSublistValue({ id: 'custpage_src_currency', line: index, value: safeValue(accrual.currencyText, 'MXN') });
+
+                    // Campos ocultos - SIEMPRE deben tener valor
+                    sublist.setSublistValue({ id: 'custpage_src_accrual_id', line: index, value: safeValue(accrual.accrualId, '0') });
+                    sublist.setSublistValue({ id: 'custpage_src_agreement_id', line: index, value: safeValue(accrual.agreementId, '0') });
+                    sublist.setSublistValue({ id: 'custpage_src_invoice_id', line: index, value: safeValue(accrual.invoiceId, '0') });
+                    sublist.setSublistValue({ id: 'custpage_src_item_id', line: index, value: safeValue(accrual.itemId, '0') });
+                    sublist.setSublistValue({ id: 'custpage_src_sett_method', line: index, value: safeValue(accrual.settlementMethod, '2') });
+                    sublist.setSublistValue({ id: 'custpage_src_payer_id', line: index, value: safeValue(accrual.payerId, '0') });
+                    sublist.setSublistValue({ id: 'custpage_src_acct_item', line: index, value: safeValue(accrual.accountingItem, '0') });
+                } catch (lineError) {
+                    log.error({
+                        title: `${MODULE}.populateSourceSublist.line`,
+                        details: `Line ${index} error: ${lineError.message}. Accrual: ${JSON.stringify(accrual)}`
+                    });
+                }
             });
 
             log.debug({ title: `${MODULE}.populateSourceSublist`, details: `Populated ${accruals.length} source lines` });

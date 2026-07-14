@@ -5,112 +5,198 @@
  *              de liquidación de rebates. Usa los Custom Records reales del SuiteApp
  *              de Rebate Management (customrecord_rm_*).
  */
-define(['N/search', 'N/query', 'N/log', 'N/runtime', './giv_rebate_constants'], (search, query, log, runtime, CONST) => {
+define(['N/search', 'N/query', 'N/log'], (search, query, log) => {
 
     const MODULE = 'giv_rebate_dao';
 
     /**
      * Obtiene provisiones (Accruals) disponibles para liquidar.
+     * Consulta optimizada que trae todos los cálculos en una sola query.
      *
-     * El modelo de datos del SuiteApp es:
-     *  - customrecord_rm_accruals: montos provisionados por acuerdo/período
-     *  - customrecord_rm_transactions: transacciones (facturas) vinculadas al acuerdo
-     *  - customrecord_rm_sales_transaction: el acuerdo con método de liquidación
-     *
-     * Se usa SuiteQL para hacer los joins necesarios entre estos 3 records.
-     *
-     * @param {Object} filters
-     * @param {string|string[]} [filters.customerId] - Internal ID(s) del cliente
-     * @param {string} [filters.agreementId] - Internal ID del acuerdo
-     * @param {string} [filters.dateFrom] - Fecha inicio (rango provisión)
-     * @param {string} [filters.dateTo] - Fecha fin (rango provisión)
-     * @returns {Object[]} Array de objetos con datos de provisiones disponibles
+     * @param {Object}            filters
+     * @param {string|string[]}   [filters.agreementId]
+     * @param {string|string[]}   [filters.sourceInvoiceIds]
+     * @param {string}            [filters.itemId]
+     * @param {string}            [filters.dateFrom]   YYYY-MM-DD
+     * @param {string}            [filters.dateTo]     YYYY-MM-DD
+     * @returns {Object[]}
      */
     const getAvailableAccruals = (filters) => {
         try {
+
             let sql = `
-                SELECT
-                    a.id                            AS accrual_id,
-                    a.${CONST.RM_ACCRUAL_FIELDS.AGREEMENT}  AS agreement_id,
-                    ag.${CONST.RM_AGREEMENT_FIELDS.NAME}    AS agreement_name,
-                    a.${CONST.RM_ACCRUAL_FIELDS.AMOUNT}     AS accrual_amount,
-                    a.${CONST.RM_ACCRUAL_FIELDS.DATE}       AS accrual_date,
-                    t.tranid                                AS invoice_number,
-                    t.id                                    AS invoice_id,
-                    tl.item                                 AS item_id,
-                    ag.${CONST.RM_AGREEMENT_FIELDS.SETTLEMENT_METHOD} AS settlement_method,
-                    ag.${CONST.RM_AGREEMENT_FIELDS.PAYER}    AS payer_id,
-                    ag.${CONST.RM_AGREEMENT_FIELDS.ACCOUNTING_ITEM} AS accounting_item,
-                    ag.${CONST.RM_AGREEMENT_FIELDS.SUBSIDIARY} AS subsidiary_id
-                FROM ${CONST.RM_RECORDS.ACCRUALS} a
-                INNER JOIN ${CONST.RM_RECORDS.AGREEMENT} ag ON a.${CONST.RM_ACCRUAL_FIELDS.AGREEMENT} = ag.id
-                LEFT JOIN transaction t ON a.${CONST.RM_ACCRUAL_FIELDS.BASE_TRANSACTION} = t.id
-                LEFT JOIN transactionline tl ON (tl.transaction = t.id AND tl.id = (SELECT MIN(id) FROM transactionline WHERE transaction = t.id AND mainline = 'F'))
-                WHERE a.isinactive = 'F'
-            `;
+   SELECT
+    /* Transaction Detail */
+    rtd.id                                            AS transaction_detail_id,
+
+    /* Accrual */
+    a.id                                              AS accrual_id,
+    a.custrecord_rm_accrual_amount                    AS accrual_amount,
+    a.custrecord_rm_accru_date                        AS accrual_date,
+
+    /* Agreement */
+    ag.id                                             AS agreement_id,
+    ag.custrecord_agreement_names                     AS agreement_name,
+    ag.custrecord_rm_settlement_method                AS settlement_method,
+    ag.custrecord_hidden_payer                        AS payer_id,
+    ag.custrecord_rm_accounting_item                  AS accounting_item,
+    ag.custrecord_rm_subsidiary                       AS subsidiary_id,
+
+    /* Source Transaction */
+    t.id                                              AS invoice_id,
+    t.tranid                                          AS invoice_number,
+
+    /* Item */
+    rtd.custrecord_rm_rebate_item                     AS item_id,
+    itm.itemid                                        AS item_name,
+
+    /* Transaction Detail Amounts */
+    rtd.custrecord_rm_td_totalamt                     AS transaction_detail_amount,
+    rtd.custrecord_rm_achieved_rebate_amount          AS achieved_rebate_amount,
+    rtd.custrecord_rm_accrual_amo                     AS accrual_detail_amount,
+    rtd.custrecord_rm_td_item_qty                     AS quantity,
+
+    /* Liquidado: el mayor entre lo liquidado nativamente (achieved_rebate_amount)
+       y lo registrado en el historial GIV, para cubrir ambas fuentes de liquidación */
+    GREATEST(
+        COALESCE(rtd.custrecord_rm_achieved_rebate_amount, 0),
+        COALESCE(
+            (
+                SELECT SUM(ABS(h.custrecord_giv_lh_src_settl_amt))
+                FROM customrecord_giv_rebate_liq_history h
+                WHERE h.custrecord_giv_lh_src_accrual = a.id
+                  AND h.isinactive = 'F'
+            ),
+            0
+        )
+    ) AS settled_amount,
+
+    /* Devoluciones */
+    COALESCE(
+        (
+            SELECT SUM(ABS(ret.custrecord_rm_accrual_amount))
+            FROM customrecord_rm_accruals ret
+            WHERE ret.custrecord_rm_accru_ra = a.custrecord_rm_accru_ra
+              AND ret.custrecord_rm_accrual_amount < 0
+              AND ret.isinactive = 'F'
+              AND ret.id <> a.id
+        ),
+        0
+    ) AS returns_amount,
+
+    /* Bloqueado */
+    COALESCE(
+        (
+            SELECT SUM(ABS(w.custrecord_giv_lw_amt_to_settle))
+            FROM customrecord_giv_rebate_liq_work w
+            WHERE w.custrecord_giv_lw_source_accrual = a.id
+              AND w.custrecord_giv_lw_proc_status IN
+                  ('Capturado','Validado','Procesando')
+              AND w.isinactive = 'F'
+        ),
+        0
+    ) AS locked_amount
+
+FROM customrecord_rm_transaction_details rtd
+
+INNER JOIN customrecord_rm_accruals a
+    ON a.id = rtd.custrecord_rm_rtd_accrual
+   AND a.isinactive = 'F'
+
+INNER JOIN customrecord_rm_sales_transaction ag
+    ON ag.id = a.custrecord_rm_accru_ra
+
+LEFT JOIN transaction t
+    ON t.id = rtd.custrecord_rm_source_transaction
+
+LEFT JOIN item itm
+    ON itm.id = rtd.custrecord_rm_rebate_item
+
+WHERE rtd.isinactive = 'F'
+
+    /* Debe existir un accrual */
+    AND rtd.custrecord_rm_rtd_accrual IS NOT NULL
+        `;
+
 
             const params = [];
 
             if (filters.agreementId) {
                 const ids = Array.isArray(filters.agreementId) ? filters.agreementId : [filters.agreementId];
                 if (ids.length > 0) {
-                    const placeholders = ids.map(() => '?').join(',');
-                    sql += ` AND a.${CONST.RM_ACCRUAL_FIELDS.AGREEMENT} IN (${placeholders})`;
+                    sql += ` AND a.custrecord_rm_accru_ra IN (${ids.map(() => '?').join(',')})`;
                     ids.forEach(id => params.push(id));
                 }
             }
 
+            if (filters.sourceInvoiceIds && filters.sourceInvoiceIds.length > 0) {
+                sql += ` AND t.id IN (${filters.sourceInvoiceIds.map(() => '?').join(',')})`;
+                filters.sourceInvoiceIds.forEach(id => params.push(id));
+            }
+
+            if (filters.itemId) {
+                sql += ` AND rtd.custrecord_rm_rebate_item = ?`;
+                params.push(filters.itemId);
+            }
+
             if (filters.dateFrom) {
-                sql += ` AND a.${CONST.RM_ACCRUAL_FIELDS.DATE} >= TO_DATE(?, 'YYYY-MM-DD')`;
+                sql += ` AND a.custrecord_rm_accru_date >= TO_DATE(?, 'YYYY-MM-DD')`;
                 params.push(filters.dateFrom);
             }
+
             if (filters.dateTo) {
-                sql += ` AND a.${CONST.RM_ACCRUAL_FIELDS.DATE} <= TO_DATE(?, 'YYYY-MM-DD')`;
+                sql += ` AND a.custrecord_rm_accru_date <= TO_DATE(?, 'YYYY-MM-DD')`;
                 params.push(filters.dateTo);
             }
 
-            sql += ` ORDER BY a.${CONST.RM_ACCRUAL_FIELDS.DATE} DESC`;
+            sql += ` ORDER BY a.custrecord_rm_accru_date DESC`;
 
-            log.debug('DAO SQL', sql);
-            log.debug('DAO Params', params);
+            log.debug({ title: `${MODULE}.getAvailableAccruals SQL`, details: sql });
+            log.debug({ title: `${MODULE}.getAvailableAccruals Params`, details: JSON.stringify(params) });
 
-            const queryResults = query.runSuiteQL({ query: sql, params: params });
-            const mappedResults = queryResults.asMappedResults();
+            const mappedResults = query.runSuiteQL({ query: sql, params }).asMappedResults();
 
-            log.debug('Raw Results Count', mappedResults.length);
-            log.debug('Raw Results JSON', JSON.stringify(mappedResults));
-
+            log.debug({ title: `${MODULE}.getAvailableAccruals raw rows`, details: mappedResults.length });
+            log.debug({ title: `${MODULE}.getAvailableAccruals raw data`, details: JSON.stringify(mappedResults) });
 
             const results = [];
-            mappedResults.forEach((row) => {
-                const accrualId = row.accrual_id;
-                const accrualAmount = parseFloat(row.accrual_amount) || 0;
-                const lockedAmount = getLockedAccrualAmount(accrualId);
-                const available = accrualAmount - lockedAmount;
+            log.debug({ title: `${MODULE}.getAvailableAccruals`, details: `Processing ${mappedResults.length} rows. First row: ${JSON.stringify(mappedResults[0])}` });
 
-                if (available > 0) {
+            mappedResults.forEach((row) => {
+                const accrualAmount = parseFloat(row.accrual_detail_amount) || 0;
+                const settledAmount = parseFloat(row.settled_amount) || 0;
+                const returnsAmount = parseFloat(row.returns_amount) || 0;
+                const lockedAmount  = parseFloat(row.locked_amount)  || 0;
+                const available     = accrualAmount - settledAmount - returnsAmount - lockedAmount;
+
+                // Solo mostrar provisiones que aún tengan saldo disponible.
+                // Esto reemplaza el filtro SQL «rtd.custrecord_rm_rtd_claim IS NULL»
+                // que excluía liquidaciones parciales. Ahora se usa el cálculo real
+                // del saldo (accrual − liquidado − devoluciones − bloqueado).
+               // if (available > 0) {
                     results.push({
-                        accrualId: String(accrualId),
-                        agreementId: String(row.agreement_id),
-                        agreementText: row.agreement_name || '',
-                        accrualAmount: accrualAmount,
-                        accrualDate: row.accrual_date || '',
-                        invoiceNumber: row.invoice_number || 'N/A',
-                        invoiceId: row.invoice_id || '',
-                        itemText: row.item_id ? ('Item #' + row.item_id) : 'N/A',
-                        itemId: row.item_id || '',
+                        accrualId:        String(row.accrual_id),
+                        agreementId:      String(row.agreement_id),
+                        agreementText:    row.agreement_name   || '',
+                        accrualAmount:    accrualAmount,
+                        settledAmount:    settledAmount,
+                        returnsAmount:    returnsAmount,
+                        accrualDate:      row.accrual_date     || '',
+                        invoiceNumber:    row.invoice_number   || 'N/A',
+                        invoiceId:        String(row.invoice_id || ''),
+                        itemId:           String(row.item_id   || ''),
+                        itemText:         row.item_name        || (row.item_id ? String(row.item_id) : 'N/A'),
                         settlementMethod: String(row.settlement_method || ''),
-                        payerId: String(row.payer_id || ''),
-                        accountingItem: String(row.accounting_item || ''),
-                        subsidiaryId: String(row.subsidiary_id || ''),
-                        lockedAmount: lockedAmount,
-                        availableAmount: available
+                        payerId:          String(row.payer_id  || ''),
+                        accountingItem:   String(row.accounting_item || ''),
+                        subsidiaryId:     String(row.subsidiary_id   || ''),
+                        lockedAmount:     lockedAmount,
+                        availableAmount:  Math.max(available, 0)
                     });
-                }
+                //}
             });
 
-            log.debug({ title: `${MODULE}.getAvailableAccruals`, details: `Found ${results} available accruals` });
-            log.debug({ title: `${MODULE}.getAvailableAccruals`, details: results });
+            log.debug({ title: `${MODULE}.getAvailableAccruals`, details: `${results.length} provisiones disponibles` });
             return results;
 
         } catch (e) {
@@ -121,37 +207,34 @@ define(['N/search', 'N/query', 'N/log', 'N/runtime', './giv_rebate_constants'], 
 
     /**
      * Obtiene las transacciones (facturas) vinculadas a un acuerdo de rebate.
-     * Estas son las transacciones origen que generaron las provisiones.
      *
-     * @param {string} agreementId - Internal ID del acuerdo
-     * @returns {Object[]} Transacciones vinculadas con detalle de factura, item y cliente
+     * @param {string} agreementId
+     * @returns {Object[]}
      */
     const getTransactionsByAgreement = (agreementId) => {
         try {
             const sql = `
                 SELECT
-                    rt.id                                       AS rm_tran_id,
-                    rt.${CONST.RM_TRANSACTION_FIELDS.INVOICE}   AS invoice_id,
-                    rt.${CONST.RM_TRANSACTION_FIELDS.ITEM}      AS item_id,
-                    rt.${CONST.RM_TRANSACTION_FIELDS.ORIGIN_DATE} AS origin_date,
-                    rt.${CONST.RM_TRANSACTION_FIELDS.CURRENCY}  AS currency_id,
-                    rt.${CONST.RM_TRANSACTION_FIELDS.REFUND_TYPE} AS refund_type,
-                    t.tranid                                    AS invoice_number,
-                    t.entity                                    AS customer_id
-                FROM ${CONST.RM_RECORDS.TRANSACTIONS} rt
+                    rt.id                                   AS rm_tran_id,
+                    rt.custrecord_rm_rebate_transaction     AS invoice_id,
+                    rt.custrecord_rm_tran_item              AS item_id,
+                    rt.custrecord_rm_origin_tran_date       AS origin_date,
+                    rt.custrecord_rebatetran_curr           AS currency_id,
+                    rt.custrecord_refund_type               AS refund_type,
+                    t.tranid                                AS invoice_number,
+                    t.entity                                AS customer_id
+                FROM customrecord_rm_transactions rt
                 INNER JOIN transaction t
-                    ON rt.${CONST.RM_TRANSACTION_FIELDS.INVOICE} = t.id
-                INNER JOIN ${CONST.RM_RECORDS.AGREEMENT_DETAILS} rad
-                    ON rad.${CONST.RM_DETAIL_FIELDS.AGREEMENT} = ?
+                    ON rt.custrecord_rm_rebate_transaction = t.id
+                INNER JOIN customrecord_rebate_agreement_details rad
+                    ON rad.custrecord_rm_rebate_agreement = ?
                 WHERE rt.isinactive = 'F'
-                    AND rt.${CONST.RM_TRANSACTION_FIELDS.REFUND_TYPE} = 'sale'
-                ORDER BY rt.${CONST.RM_TRANSACTION_FIELDS.ORIGIN_DATE} DESC
+                    AND rt.custrecord_refund_type = 'sale'
+                ORDER BY rt.custrecord_rm_origin_tran_date DESC
             `;
 
-            const queryResults = query.runSuiteQL({ query: sql, params: [agreementId] });
-            const results = queryResults.asMappedResults();
-
-            log.debug({ title: `${MODULE}.getTransactionsByAgreement`, details: `Found ${results.length} transactions for agreement ${agreementId}` });
+            const results = query.runSuiteQL({ query: sql, params: [agreementId] }).asMappedResults();
+            log.debug({ title: `${MODULE}.getTransactionsByAgreement`, details: `${results.length} transacciones` });
             return results;
 
         } catch (e) {
@@ -161,25 +244,24 @@ define(['N/search', 'N/query', 'N/log', 'N/runtime', './giv_rebate_constants'], 
     };
 
     /**
-     * Obtiene los clientes configurados en un acuerdo de rebate (desde Agreement Details).
+     * Obtiene los clientes configurados en un acuerdo de rebate.
      *
-     * @param {string} agreementId - Internal ID del acuerdo
-     * @returns {string[]} Array de Internal IDs de clientes
+     * @param {string} agreementId
+     * @returns {string[]}
      */
     const getCustomersByAgreement = (agreementId) => {
         try {
             const sql = `
-                SELECT DISTINCT ${CONST.RM_DETAIL_FIELDS.CUSTOMER_INCLUDE_1} AS customer_id
-                FROM ${CONST.RM_RECORDS.AGREEMENT_DETAILS}
-                WHERE ${CONST.RM_DETAIL_FIELDS.AGREEMENT} = ?
-                  AND ${CONST.RM_DETAIL_FIELDS.CUSTOMER_INCLUDE_1} IS NOT NULL
+                SELECT DISTINCT custrecord_custinc_v1 AS customer_id
+                FROM customrecord_rebate_agreement_details
+                WHERE custrecord_rm_rebate_agreement = ?
+                  AND custrecord_custinc_v1 IS NOT NULL
                   AND isinactive = 'F'
             `;
 
-            const queryResults = query.runSuiteQL({ query: sql, params: [agreementId] });
-            const results = queryResults.asMappedResults();
-
-            return results.map(r => String(r.customer_id));
+            return query.runSuiteQL({ query: sql, params: [agreementId] })
+                        .asMappedResults()
+                        .map(r => String(r.customer_id));
 
         } catch (e) {
             log.error({ title: `${MODULE}.getCustomersByAgreement`, details: e.message });
@@ -188,39 +270,115 @@ define(['N/search', 'N/query', 'N/log', 'N/runtime', './giv_rebate_constants'], 
     };
 
     /**
-     * Obtiene el monto ya "bloqueado" en registros WORK para un accrual específico.
-     * Evita que dos usuarios liquiden la misma provisión simultáneamente.
+     * Obtiene el monto ya liquidado de un accrual.
      *
-     * @param {string} accrualId - Internal ID del accrual
-     * @returns {number} Monto total bloqueado
+     * NOTA: El módulo nativo de NetSuite Rebates genera settlements por acuerdo completo,
+     * no por accrual individual. No hay una relación directa almacenada.
+     *
+     * Para calcular correctamente el monto liquidado, usamos la tabla propia
+     * GIV_REBATE_LIQ_HISTORY que guarda qué accruals se han liquidado.
+     *
+     * @param {string} accrualId
+     * @returns {number}
+     */
+    const getSettledAmountByAccrual = (accrualId) => {
+        try {
+            // Buscar en nuestro historial de liquidaciones (GIV_REBATE_LIQ_HISTORY)
+            // qué se ha liquidado de este accrual específico
+            const historySearch = search.create({
+                type: 'customrecord_giv_rebate_liq_history',
+                filters: [
+                    ['custrecord_giv_lh_src_accrual', 'anyof', accrualId],
+                    'AND',
+                    ['isinactive', 'is', 'F']
+                ],
+                columns: [
+                    search.createColumn({
+                        name: 'custrecord_giv_lh_src_settl_amt',
+                        summary: search.Summary.SUM
+                    })
+                ]
+            });
+
+            let settledAmount = 0;
+            historySearch.run().each((result) => {
+                settledAmount = parseFloat(result.getValue({
+                    name: 'custrecord_giv_lh_src_settl_amt',
+                    summary: search.Summary.SUM
+                })) || 0;
+                return false;
+            });
+
+            return Math.abs(settledAmount);
+
+        } catch (e) {
+            log.error({ title: `${MODULE}.getSettledAmountByAccrual`, details: e.message });
+            // Si la tabla no existe aún (primera vez que se usa), retornar 0
+            return 0;
+        }
+    };
+
+    /**
+     * Obtiene el monto de devoluciones (accruals negativos) relacionados a un accrual origen.
+     * Busca accruals negativos del mismo acuerdo y factura base que el accrual dado.
+     *
+     * @param {string} accrualId
+     * @returns {number}  Valor absoluto del impacto negativo por devoluciones
+     */
+    const getReturnsAccrualAmount = (accrualId) => {
+        try {
+            const sql = `
+                SELECT COALESCE(SUM(ret.custrecord_rm_accrual_amount), 0) AS returns_total
+                FROM customrecord_rm_accruals ret
+                INNER JOIN customrecord_rm_accruals orig
+                    ON  ret.custrecord_rm_accru_ra              = orig.custrecord_rm_accru_ra
+                    AND ret.custrecord_rm_accrual_base_transaction = orig.custrecord_rm_accrual_base_transaction
+                WHERE orig.id                        = ?
+                  AND ret.custrecord_rm_accrual_amount < 0
+                  AND ret.isinactive                 = 'F'
+                  AND ret.id                         <> orig.id
+            `;
+
+            const rows = query.runSuiteQL({ query: sql, params: [accrualId] }).asMappedResults();
+            return Math.abs(parseFloat(rows[0]?.returns_total) || 0);
+
+        } catch (e) {
+            log.error({ title: `${MODULE}.getReturnsAccrualAmount`, details: e.message });
+            return 0;
+        }
+    };
+
+    /**
+     * Obtiene el monto "bloqueado" en registros WORK para un accrual
+     * (estados Capturado / Validado / Procesando).
+     *
+     * @param {string} accrualId
+     * @returns {number}
      */
     const getLockedAccrualAmount = (accrualId) => {
         try {
             const workSearch = search.create({
-                type: CONST.GIV_RECORDS.WORK,
+                type: 'customrecord_giv_rebate_liq_work',
                 filters: [
-                    [CONST.WORK_FIELDS.SOURCE_ACCRUAL, 'anyof', accrualId],
+                    ['custrecord_giv_lw_source_accrual', 'anyof', accrualId],
                     'AND',
                     [
-                        [CONST.WORK_FIELDS.PROC_STATUS, 'is', CONST.STATUS.CAPTURED],
+                        ['custrecord_giv_lw_proc_status', 'is', 'Capturado'],
                         'OR',
-                        [CONST.WORK_FIELDS.PROC_STATUS, 'is', CONST.STATUS.VALIDATED],
+                        ['custrecord_giv_lw_proc_status', 'is', 'Validado'],
                         'OR',
-                        [CONST.WORK_FIELDS.PROC_STATUS, 'is', CONST.STATUS.PROCESSING]
+                        ['custrecord_giv_lw_proc_status', 'is', 'Procesando']
                     ]
                 ],
                 columns: [
-                    search.createColumn({
-                        name: CONST.WORK_FIELDS.AMT_TO_SETTLE,
-                        summary: search.Summary.SUM
-                    })
+                    search.createColumn({ name: 'custrecord_giv_lw_amt_to_settle', summary: search.Summary.SUM })
                 ]
             });
 
             let locked = 0;
             workSearch.run().each((result) => {
                 locked = parseFloat(result.getValue({
-                    name: CONST.WORK_FIELDS.AMT_TO_SETTLE,
+                    name: 'custrecord_giv_lw_amt_to_settle',
                     summary: search.Summary.SUM
                 })) || 0;
                 return false;
@@ -235,10 +393,10 @@ define(['N/search', 'N/query', 'N/log', 'N/runtime', './giv_rebate_constants'], 
     };
 
     /**
-     * Obtiene facturas abiertas de un cliente para la sublista destino.
+     * Obtiene facturas abiertas de uno o varios clientes.
      *
-     * @param {string[]} customerIds - Internal IDs de los clientes
-     * @returns {Object[]} Facturas abiertas con saldo
+     * @param {string[]} customerIds
+     * @returns {Object[]}
      */
     const getOpenInvoices = (customerIds) => {
         try {
@@ -247,11 +405,11 @@ define(['N/search', 'N/query', 'N/log', 'N/runtime', './giv_rebate_constants'], 
             const invoiceSearch = search.create({
                 type: search.Type.INVOICE,
                 filters: [
-                    ['entity', 'anyof', ...customerIds],
+                    ['entity',          'anyof',      ...customerIds],
                     'AND',
-                    ['status', 'anyof', 'CustInvc:A'],
+                    ['status',          'anyof',       'CustInvc:A'],
                     'AND',
-                    ['mainline', 'is', 'T'],
+                    ['mainline',        'is',          'T'],
                     'AND',
                     ['amountremaining', 'greaterthan', 0]
                 ],
@@ -269,20 +427,20 @@ define(['N/search', 'N/query', 'N/log', 'N/runtime', './giv_rebate_constants'], 
             const results = [];
             invoiceSearch.run().each((result) => {
                 results.push({
-                    invoiceId: result.getValue('internalid'),
-                    tranId: result.getValue('tranid'),
-                    customerId: result.getValue('entity'),
-                    customerText: result.getText('entity'),
-                    date: result.getValue('trandate'),
-                    total: parseFloat(result.getValue('total')) || 0,
+                    invoiceId:       result.getValue('internalid'),
+                    tranId:          result.getValue('tranid'),
+                    customerId:      result.getValue('entity'),
+                    customerText:    result.getText('entity'),
+                    date:            result.getValue('trandate'),
+                    total:           parseFloat(result.getValue('total'))           || 0,
                     amountRemaining: parseFloat(result.getValue('amountremaining')) || 0,
-                    currency: result.getValue('currency'),
-                    currencyText: result.getText('currency')
+                    currency:        result.getValue('currency'),
+                    currencyText:    result.getText('currency')
                 });
                 return true;
             });
 
-            log.debug({ title: `${MODULE}.getOpenInvoices`, details: `Found ${results.length} open invoices` });
+            log.debug({ title: `${MODULE}.getOpenInvoices`, details: `${results.length} facturas abiertas` });
             return results;
 
         } catch (e) {
@@ -292,11 +450,11 @@ define(['N/search', 'N/query', 'N/log', 'N/runtime', './giv_rebate_constants'], 
     };
 
     /**
-     * Obtiene información fiscal de una línea de factura.
+     * Obtiene información fiscal (tax code y tasa) de una línea de factura.
      *
-     * @param {string} invoiceId - Internal ID de la factura
-     * @param {string} itemId - Internal ID del artículo
-     * @returns {Object} Información fiscal {taxCodeId, taxRate}
+     * @param {string} invoiceId
+     * @param {string} itemId
+     * @returns {{ taxCodeId: string, taxRate: number }}
      */
     const getTaxInfoFromInvoiceLine = (invoiceId, itemId) => {
         try {
@@ -305,13 +463,13 @@ define(['N/search', 'N/query', 'N/log', 'N/runtime', './giv_rebate_constants'], 
             const lineSearch = search.create({
                 type: search.Type.INVOICE,
                 filters: [
-                    ['internalid', 'is', invoiceId],
+                    ['internalid', 'is',    invoiceId],
                     'AND',
-                    ['item', 'anyof', itemId],
+                    ['item',       'anyof', itemId],
                     'AND',
-                    ['mainline', 'is', 'F'],
+                    ['mainline',   'is',    'F'],
                     'AND',
-                    ['taxline', 'is', 'F']
+                    ['taxline',    'is',    'F']
                 ],
                 columns: [
                     search.createColumn({ name: 'taxcode' }),
@@ -322,7 +480,7 @@ define(['N/search', 'N/query', 'N/log', 'N/runtime', './giv_rebate_constants'], 
             let taxInfo = { taxCodeId: '', taxRate: 0 };
             lineSearch.run().each((result) => {
                 taxInfo.taxCodeId = result.getValue('taxcode') || '';
-                taxInfo.taxRate = parseFloat(result.getValue('taxrate')) || 0;
+                taxInfo.taxRate   = parseFloat(result.getValue('taxrate')) || 0;
                 return false;
             });
 
@@ -337,33 +495,28 @@ define(['N/search', 'N/query', 'N/log', 'N/runtime', './giv_rebate_constants'], 
     /**
      * Obtiene datos de un acuerdo de rebate por su Internal ID.
      *
-     * @param {string} agreementId - Internal ID del acuerdo
-     * @returns {Object|null} Datos del acuerdo
+     * @param {string} agreementId
+     * @returns {Object|null}
      */
     const getAgreement = (agreementId) => {
         try {
             const sql = `
                 SELECT
                     id,
-                    ${CONST.RM_AGREEMENT_FIELDS.NAME} AS name,
-                    ${CONST.RM_AGREEMENT_FIELDS.SETTLEMENT_METHOD} AS settlement_method,
-                    ${CONST.RM_AGREEMENT_FIELDS.PAYER} AS payer_id,
-                    ${CONST.RM_AGREEMENT_FIELDS.ACCOUNTING_ITEM} AS accounting_item,
-                    ${CONST.RM_AGREEMENT_FIELDS.SUBSIDIARY} AS subsidiary_id,
-                    ${CONST.RM_AGREEMENT_FIELDS.STATUS} AS status,
-                    ${CONST.RM_AGREEMENT_FIELDS.ACCRUAL_CREDIT_ACCOUNT} AS credit_account,
-                    ${CONST.RM_AGREEMENT_FIELDS.ACCRUAL_DEBIT_ACCOUNT} AS debit_account
-                FROM ${CONST.RM_RECORDS.AGREEMENT}
+                    custrecord_agreement_names              AS name,
+                    custrecord_rm_settlement_method         AS settlement_method,
+                    custrecord_hidden_payer                 AS payer_id,
+                    custrecord_rm_accounting_item           AS accounting_item,
+                    custrecord_rm_subsidiary                AS subsidiary_id,
+                    custrecord_status_field                 AS status,
+                    custrecord_rm_ra_accrual_credit_account AS credit_account,
+                    custrecord_rm_ra_accrual_debit_account  AS debit_account
+                FROM customrecord_rm_sales_transaction
                 WHERE id = ?
             `;
 
-            const queryResults = query.runSuiteQL({ query: sql, params: [agreementId] });
-            const results = queryResults.asMappedResults();
-
-            if (results.length > 0) {
-                return results[0];
-            }
-            return null;
+            const results = query.runSuiteQL({ query: sql, params: [agreementId] }).asMappedResults();
+            return results.length > 0 ? results[0] : null;
 
         } catch (e) {
             log.error({ title: `${MODULE}.getAgreement`, details: e.message });
@@ -374,64 +527,62 @@ define(['N/search', 'N/query', 'N/log', 'N/runtime', './giv_rebate_constants'], 
     /**
      * Obtiene registros WORK pendientes de procesar.
      *
-     * @param {string} [status] - Filtrar por estado específico (default: Capturado)
-     * @returns {Object[]} Registros WORK pendientes
+     * @param {string} [status]  Estado a filtrar (default: 'Capturado')
+     * @returns {Object[]}
      */
     const getPendingWorkRecords = (status) => {
         try {
-            const filterStatus = status || CONST.STATUS.CAPTURED;
-
             const workSearch = search.create({
-                type: CONST.GIV_RECORDS.WORK,
+                type: 'customrecord_giv_rebate_liq_work',
                 filters: [
-                    [CONST.WORK_FIELDS.PROC_STATUS, 'is', filterStatus]
+                    ['custrecord_giv_lw_proc_status', 'is', status || 'Capturado']
                 ],
                 columns: [
-                    search.createColumn({ name: 'internalid' }),
-                    search.createColumn({ name: CONST.WORK_FIELDS.CUSTOMER }),
-                    search.createColumn({ name: CONST.WORK_FIELDS.AGREEMENT }),
-                    search.createColumn({ name: CONST.WORK_FIELDS.SOURCE_INVOICE }),
-                    search.createColumn({ name: CONST.WORK_FIELDS.SOURCE_ACCRUAL }),
-                    search.createColumn({ name: CONST.WORK_FIELDS.SOURCE_ITEM }),
-                    search.createColumn({ name: CONST.WORK_FIELDS.INVOICE_TO }),
-                    search.createColumn({ name: CONST.WORK_FIELDS.TAX_CODE }),
-                    search.createColumn({ name: CONST.WORK_FIELDS.SETTLE_METHOD }),
-                    search.createColumn({ name: CONST.WORK_FIELDS.SCENARIO }),
-                    search.createColumn({ name: CONST.WORK_FIELDS.ORIGINAL_AMT }),
-                    search.createColumn({ name: CONST.WORK_FIELDS.AVAILABLE_AMT }),
-                    search.createColumn({ name: CONST.WORK_FIELDS.AMT_TO_SETTLE }),
-                    search.createColumn({ name: CONST.WORK_FIELDS.APPLY_AMOUNT }),
-                    search.createColumn({ name: CONST.WORK_FIELDS.TAX_BASIS }),
-                    search.createColumn({ name: CONST.WORK_FIELDS.EXCESS_FLAG }),
-                    search.createColumn({ name: CONST.WORK_FIELDS.CREATED_FROM })
+                    search.createColumn({ name: 'internalid'                     }),
+                    search.createColumn({ name: 'custrecord_giv_lw_customer'      }),
+                    search.createColumn({ name: 'custrecord_giv_lw_agreement'     }),
+                    search.createColumn({ name: 'custrecord_giv_lw_source_invoice'}),
+                    search.createColumn({ name: 'custrecord_giv_lw_source_accrual'}),
+                    search.createColumn({ name: 'custrecord_giv_lw_source_item'   }),
+                    search.createColumn({ name: 'custrecord_giv_lw_invoice_to'    }),
+                    search.createColumn({ name: 'custrecord_giv_lw_taxcode'       }),
+                    search.createColumn({ name: 'custrecord_giv_lw_settle_method' }),
+                    search.createColumn({ name: 'custrecord_giv_lw_scenario'      }),
+                    search.createColumn({ name: 'custrecord_giv_lw_original_amt'  }),
+                    search.createColumn({ name: 'custrecord_giv_lw_available_amt' }),
+                    search.createColumn({ name: 'custrecord_giv_lw_amt_to_settle' }),
+                    search.createColumn({ name: 'custrecord_giv_lw_apply_amount'  }),
+                    search.createColumn({ name: 'custrecord_giv_lw_tax_basis'     }),
+                    search.createColumn({ name: 'custrecord_giv_lw_excess_flag'   }),
+                    search.createColumn({ name: 'custrecord_giv_lw_created_from'  })
                 ]
             });
 
             const results = [];
             workSearch.run().each((result) => {
                 results.push({
-                    workId: result.getValue('internalid'),
-                    customerId: result.getValue(CONST.WORK_FIELDS.CUSTOMER),
-                    agreementId: result.getValue(CONST.WORK_FIELDS.AGREEMENT),
-                    sourceInvoiceId: result.getValue(CONST.WORK_FIELDS.SOURCE_INVOICE),
-                    sourceAccrualId: result.getValue(CONST.WORK_FIELDS.SOURCE_ACCRUAL),
-                    sourceItemId: result.getValue(CONST.WORK_FIELDS.SOURCE_ITEM),
-                    invoiceToId: result.getValue(CONST.WORK_FIELDS.INVOICE_TO),
-                    taxCodeId: result.getValue(CONST.WORK_FIELDS.TAX_CODE),
-                    settlementMethod: result.getValue(CONST.WORK_FIELDS.SETTLE_METHOD),
-                    scenario: result.getValue(CONST.WORK_FIELDS.SCENARIO),
-                    originalAmount: parseFloat(result.getValue(CONST.WORK_FIELDS.ORIGINAL_AMT)) || 0,
-                    availableAmount: parseFloat(result.getValue(CONST.WORK_FIELDS.AVAILABLE_AMT)) || 0,
-                    amountToSettle: parseFloat(result.getValue(CONST.WORK_FIELDS.AMT_TO_SETTLE)) || 0,
-                    applyAmount: parseFloat(result.getValue(CONST.WORK_FIELDS.APPLY_AMOUNT)) || 0,
-                    taxBasis: parseFloat(result.getValue(CONST.WORK_FIELDS.TAX_BASIS)) || 0,
-                    excessFlag: result.getValue(CONST.WORK_FIELDS.EXCESS_FLAG),
-                    createdFrom: result.getValue(CONST.WORK_FIELDS.CREATED_FROM)
+                    workId:           result.getValue('internalid'),
+                    customerId:       result.getValue('custrecord_giv_lw_customer'),
+                    agreementId:      result.getValue('custrecord_giv_lw_agreement'),
+                    sourceInvoiceId:  result.getValue('custrecord_giv_lw_source_invoice'),
+                    sourceAccrualId:  result.getValue('custrecord_giv_lw_source_accrual'),
+                    sourceItemId:     result.getValue('custrecord_giv_lw_source_item'),
+                    invoiceToId:      result.getValue('custrecord_giv_lw_invoice_to'),
+                    taxCodeId:        result.getValue('custrecord_giv_lw_taxcode'),
+                    settlementMethod: result.getValue('custrecord_giv_lw_settle_method'),
+                    scenario:         result.getValue('custrecord_giv_lw_scenario'),
+                    originalAmount:   parseFloat(result.getValue('custrecord_giv_lw_original_amt'))  || 0,
+                    availableAmount:  parseFloat(result.getValue('custrecord_giv_lw_available_amt')) || 0,
+                    amountToSettle:   parseFloat(result.getValue('custrecord_giv_lw_amt_to_settle')) || 0,
+                    applyAmount:      parseFloat(result.getValue('custrecord_giv_lw_apply_amount'))  || 0,
+                    taxBasis:         parseFloat(result.getValue('custrecord_giv_lw_tax_basis'))     || 0,
+                    excessFlag:       result.getValue('custrecord_giv_lw_excess_flag'),
+                    createdFrom:      result.getValue('custrecord_giv_lw_created_from')
                 });
                 return true;
             });
 
-            log.debug({ title: `${MODULE}.getPendingWorkRecords`, details: `Found ${results.length} pending WORK records` });
+            log.debug({ title: `${MODULE}.getPendingWorkRecords`, details: `${results.length} registros WORK pendientes` });
             return results;
 
         } catch (e) {
@@ -444,6 +595,8 @@ define(['N/search', 'N/query', 'N/log', 'N/runtime', './giv_rebate_constants'], 
         getAvailableAccruals,
         getTransactionsByAgreement,
         getCustomersByAgreement,
+        getSettledAmountByAccrual,
+        getReturnsAccrualAmount,
         getLockedAccrualAmount,
         getLockedAccrualAmounts: getLockedAccrualAmount,
         getOpenInvoices,

@@ -131,20 +131,20 @@ define([
         try {
             const filters = [];
             if (batchId) {
-                filters.push(['custrecord_giv_liq_work_csv_batch_id', 'is', batchId]);
+                filters.push(['custrecord_giv_lw_csv_batch_id', 'is', batchId]);
             }
 
             const counterSearch = search.create({
                 type: 'customrecord_giv_rebate_liq_work',
                 filters: filters.length > 0 ? filters : [],
                 columns: [
-                    search.createColumn({ name: 'custrecord_giv_liq_work_processing_status', summary: search.Summary.GROUP }),
+                    search.createColumn({ name: 'custrecord_giv_lw_proc_status', summary: search.Summary.GROUP }),
                     search.createColumn({ name: 'internalid', summary: search.Summary.COUNT })
                 ]
             });
 
             counterSearch.run().each((result) => {
-                const status = result.getValue({ name: 'custrecord_giv_liq_work_processing_status', summary: search.Summary.GROUP });
+                const status = result.getValue({ name: 'custrecord_giv_lw_proc_status', summary: search.Summary.GROUP });
                 const count = parseInt(result.getValue({ name: 'internalid', summary: search.Summary.COUNT })) || 0;
 
                 switch (status) {
@@ -171,7 +171,7 @@ define([
         try {
             const filters = [];
             if (batchId) {
-                filters.push(['custrecord_giv_liq_work_csv_batch_id', 'is', batchId]);
+                filters.push(['custrecord_giv_lw_csv_batch_id', 'is', batchId]);
             }
 
             const workSearch = search.create({
@@ -179,14 +179,14 @@ define([
                 filters: filters.length > 0 ? filters : [],
                 columns: [
                     search.createColumn({ name: 'internalid', sort: search.Sort.DESC }),
-                    search.createColumn({ name: 'custrecord_giv_liq_work_processing_status' }),
-                    search.createColumn({ name: 'custrecord_giv_liq_work_customer' }),
-                    search.createColumn({ name: 'custrecord_giv_liq_work_agreement' }),
-                    search.createColumn({ name: 'custrecord_giv_liq_work_source_invoice' }),
-                    search.createColumn({ name: 'custrecord_giv_liq_work_source_item' }),
-                    search.createColumn({ name: 'custrecord_giv_liq_work_amount_to_settle' }),
-                    search.createColumn({ name: 'custrecord_giv_liq_work_processed_transaction' }),
-                    search.createColumn({ name: 'custrecord_giv_liq_work_error_message' })
+                    search.createColumn({ name: 'custrecord_giv_lw_proc_status' }),
+                    search.createColumn({ name: 'custrecord_giv_lw_customer' }),
+                    search.createColumn({ name: 'custrecord_giv_lw_agreement' }),
+                    search.createColumn({ name: 'custrecord_giv_lw_source_invoice' }),
+                    search.createColumn({ name: 'custrecord_giv_lw_source_item' }),
+                    search.createColumn({ name: 'custrecord_giv_lw_amt_to_settle' }),
+                    search.createColumn({ name: 'custrecord_giv_lw_processed_tran' }),
+                    search.createColumn({ name: 'custrecord_giv_lw_error_message' })
                 ]
             });
 
@@ -194,15 +194,15 @@ define([
             workSearch.run().each((result) => {
                 if (lineIndex >= 500) return false;
 
-                sublist.setSublistValue({ id: 'custpage_wk_id', line: lineIndex, value: result.getValue('internalid') || '' });
-                sublist.setSublistValue({ id: 'custpage_wk_status', line: lineIndex, value: result.getText('custrecord_giv_liq_work_processing_status') || '' });
-                sublist.setSublistValue({ id: 'custpage_wk_customer', line: lineIndex, value: result.getText('custrecord_giv_liq_work_customer') || '' });
-                sublist.setSublistValue({ id: 'custpage_wk_agreement', line: lineIndex, value: result.getText('custrecord_giv_liq_work_agreement') || '' });
-                sublist.setSublistValue({ id: 'custpage_wk_invoice', line: lineIndex, value: result.getText('custrecord_giv_liq_work_source_invoice') || '' });
-                sublist.setSublistValue({ id: 'custpage_wk_item', line: lineIndex, value: result.getText('custrecord_giv_liq_work_source_item') || '' });
-                sublist.setSublistValue({ id: 'custpage_wk_amount', line: lineIndex, value: result.getValue('custrecord_giv_liq_work_amount_to_settle') || '0.00' });
-                sublist.setSublistValue({ id: 'custpage_wk_transaction', line: lineIndex, value: result.getText('custrecord_giv_liq_work_processed_transaction') || '' });
-                sublist.setSublistValue({ id: 'custpage_wk_error', line: lineIndex, value: result.getValue('custrecord_giv_liq_work_error_message') || '' });
+                sublist.setSublistValue({ id: 'custpage_wk_id',          line: lineIndex, value: result.getValue('internalid') || '' });
+                sublist.setSublistValue({ id: 'custpage_wk_status',      line: lineIndex, value: result.getText('custrecord_giv_lw_proc_status') || '' });
+                sublist.setSublistValue({ id: 'custpage_wk_customer',    line: lineIndex, value: result.getText('custrecord_giv_lw_customer') || '' });
+                sublist.setSublistValue({ id: 'custpage_wk_agreement',   line: lineIndex, value: result.getText('custrecord_giv_lw_agreement') || '' });
+                sublist.setSublistValue({ id: 'custpage_wk_invoice',     line: lineIndex, value: result.getText('custrecord_giv_lw_source_invoice') || '' });
+                sublist.setSublistValue({ id: 'custpage_wk_item',        line: lineIndex, value: result.getText('custrecord_giv_lw_source_item') || '' });
+                sublist.setSublistValue({ id: 'custpage_wk_amount',      line: lineIndex, value: result.getValue('custrecord_giv_lw_amt_to_settle') || '0.00' });
+                sublist.setSublistValue({ id: 'custpage_wk_transaction', line: lineIndex, value: result.getText('custrecord_giv_lw_processed_tran') || '' });
+                sublist.setSublistValue({ id: 'custpage_wk_error',       line: lineIndex, value: result.getValue('custrecord_giv_lw_error_message') || '' });
 
                 lineIndex++;
                 return true;

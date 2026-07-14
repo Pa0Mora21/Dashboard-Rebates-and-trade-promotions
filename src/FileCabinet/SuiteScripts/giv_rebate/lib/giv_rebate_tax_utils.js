@@ -4,7 +4,7 @@
  * @description Utilidades fiscales para manejo de Tax Details Override (Escenario 9)
  *              y herencia de programas fiscales desde la factura origen.
  */
-define(['N/log', './giv_rebate_constants', './giv_rebate_dao'], (log, CONST, dao) => {
+define(['N/log', './giv_rebate_dao'], (log, dao) => {
 
     const MODULE = 'giv_rebate_tax_utils';
 

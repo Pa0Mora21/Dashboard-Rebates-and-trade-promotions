@@ -3,12 +3,33 @@
   <notifyadmins>F</notifyadmins>
   <scriptfile>[/SuiteScripts/giv_rebate/userevent/giv_ue_exclude_return_accruals.js]</scriptfile>
   <scriptdeployments>
-    <scriptdeployment scriptid="customdeploy_giv_ue_exclude_ret">
+
+    <!--
+      Deployment 1: Credit Memo
+      DRD Escenario 7 — intercepta beforeSubmit en CREATE para desmarcar acuerdos
+      con custrecord_giv_exclude_returns = T y evitar provisiones negativas.
+    -->
+    <scriptdeployment scriptid="customdeploy_giv_ue_exclude_ret_cm">
       <isdeployed>T</isdeployed>
       <loglevel>DEBUG</loglevel>
       <runasrole>ADMINISTRATOR</runasrole>
       <status>TESTING</status>
       <recordtype>CREDITMEMO</recordtype>
     </scriptdeployment>
+
+    <!--
+      Deployment 2: Return Authorization (RMA)
+      DRD Escenario 7 — el mismo script debe ejecutarse también en RMA porque
+      las devoluciones pueden originarse como autorización antes de la nota de crédito.
+      CORRECCIÓN DRD: faltaba este deployment.
+    -->
+    <scriptdeployment scriptid="customdeploy_giv_ue_exclude_ret_rma">
+      <isdeployed>T</isdeployed>
+      <loglevel>DEBUG</loglevel>
+      <runasrole>ADMINISTRATOR</runasrole>
+      <status>TESTING</status>
+      <recordtype>RETURNAUTHORIZATION</recordtype>
+    </scriptdeployment>
+
   </scriptdeployments>
 </usereventscript>
