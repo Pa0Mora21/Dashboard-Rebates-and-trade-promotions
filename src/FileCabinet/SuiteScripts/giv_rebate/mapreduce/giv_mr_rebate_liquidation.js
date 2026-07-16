@@ -213,27 +213,33 @@ define([
 
                 } else if (scenario === 'Cobro en exceso') {
                     // Escenario 4 — Prorrateo del excedente entre líneas de fuente
+                    // DRD: Monto Final Línea = Provisión Línea + ((Provisión Línea / Total Provisión) × Excedente)
+                    // totalRequested = suma de amountToSettle del usuario (puede ser > totalAvailable)
+                    // provisionAmount = availableAmount por línea (base del prorrateo)
                     const sourceWorkRecords = workRecords.filter(wr => parseFloat(wr.amountToSettle) > 0);
+
+                    // El total solicitado proviene de los WORK records (lo que el usuario capturó)
                     const totalRequested = sourceWorkRecords.reduce((sum, wr) => sum + (parseFloat(wr.amountToSettle) || 0), 0);
 
                     const linesForProration = sourceWorkRecords.map(wr => ({
                         ...wr,
-                        provisionAmount: parseFloat(wr.availableAmount) || 0
+                        provisionAmount: parseFloat(wr.availableAmount) || 0  // peso = saldo disponible
                     }));
 
                     const proratedLines = validator.calculateExcessProration(linesForProration, totalRequested);
 
                     cmLines = proratedLines.map(wr => ({
-                        itemId: agreement.accounting_item,
-                        amount: wr.finalAmount,
-                        taxCodeId: wr.taxCodeId,
+                        itemId:      agreement.accounting_item,
+                        amount:      wr.finalAmount,
+                        taxCodeId:   wr.taxCodeId,
                         description: `Liquidación rebate (exceso) - Acuerdo ${agreementId}`
                     }));
 
-                    // Actualizar amountToSettle en cada WORK con el monto prorrateado
+                    // [FIX 1] Actualizar cada WORK con el monto prorrateado real del CM
+                    // Antes este updateWorkRecord era un no-op (proratedAmount no estaba mapeado)
                     proratedLines.forEach(wr => {
                         txnBuilder.updateWorkRecord(wr.workId, {
-                            proratedAmount: wr.finalAmount
+                            proratedAmount: wr.finalAmount   // → custrecord_giv_lw_amt_to_settle
                         });
                     });
 
@@ -298,37 +304,39 @@ define([
             }
 
             // ── Actualizar WORK a Completado y crear History ──
+            // [FIX 2] Calcular la diferencia GLOBAL antes del loop para Cobro en exceso.
+            // DRD: la diferencia es el excedente total del lote, no una diferencia por línea individual.
+            const totalAvailableInGroup = workRecords.reduce((s, wr) => s + (parseFloat(wr.availableAmount) || 0), 0);
+            const totalSettledInGroup   = workRecords.reduce((s, wr) => s + (parseFloat(wr.amountToSettle)  || 0), 0);
+            const globalDiff = scenario === 'Cobro en exceso'
+                ? Math.round((totalSettledInGroup - totalAvailableInGroup) * 100) / 100
+                : 0;
+
             workRecords.forEach(wr => {
                 txnBuilder.updateWorkRecord(wr.workId, {
-                    status: 'Completado',
+                    status:               'Completado',
                     processedTransaction: generatedTxnId,
-                    errorMessage: ''
+                    errorMessage:         ''
                 });
 
-                const settledAmt  = parseFloat(wr.amountToSettle) || 0;
-                const availAmt    = parseFloat(wr.availableAmount) || 0;
-                // Diferencia solo aplica en Cobro en exceso
-                const difference  = scenario === 'Cobro en exceso'
-                    ? Math.round((settledAmt - availAmt) * 100) / 100
-                    : 0;
-
                 txnBuilder.createHistoryRecord({
-                    customerId:            wr.customerId,
-                    agreementId:           wr.agreementId,
-                    scenario:              scenario,
-                    transactionType:       transactionType,
+                    customerId:             wr.customerId,
+                    agreementId:            wr.agreementId,
+                    scenario:               scenario,
+                    transactionType:        transactionType,
                     generatedTransactionId: generatedTxnId,
-                    sourceAccrualId:       wr.sourceAccrualId,
-                    sourceInvoiceId:       wr.sourceInvoiceId,
-                    sourceItemId:          wr.sourceItemId,
-                    invoiceTo:             wr.invoiceTo,
-                    accrualAmount:         parseFloat(wr.originalAmount) || 0,
-                    settledAmount:         settledAmt,
-                    appliedAmount:         parseFloat(wr.applyAmount) || 0,
-                    difference:            difference,
-                    taxCodeId:             wr.taxCodeId,
-                    taxBasis:              parseFloat(wr.taxBasis) || 0,
-                    csvBatchId:            wr.csvBatchId
+                    sourceAccrualId:        wr.sourceAccrualId,
+                    sourceInvoiceId:        wr.sourceInvoiceId,
+                    sourceItemId:           wr.sourceItemId,
+                    invoiceTo:              wr.invoiceTo,
+                    accrualAmount:          parseFloat(wr.originalAmount) || 0,
+                    settledAmount:          parseFloat(wr.amountToSettle) || 0,
+                    appliedAmount:          parseFloat(wr.applyAmount) || 0,
+                    // [FIX 2] globalDiff = excedente total del lote, no diferencia por línea
+                    difference:             globalDiff,
+                    taxCodeId:              wr.taxCodeId,
+                    taxBasis:               parseFloat(wr.taxBasis) || 0,
+                    csvBatchId:             wr.csvBatchId
                 });
             });
 

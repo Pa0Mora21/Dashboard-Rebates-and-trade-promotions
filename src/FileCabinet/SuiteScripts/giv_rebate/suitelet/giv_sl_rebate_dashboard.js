@@ -107,6 +107,29 @@ define([
             form.addButton({ id: 'custpage_search_btn', label: LBL.BTN_SEARCH, functionName: 'searchAccruals' });
             form.addSubmitButton({ label: LBL.BTN_PROCESS });
 
+            // ── Badge de total seleccionado (se actualiza dinámicamente via JS) ──
+            const totalBadgeField = form.addField({
+                id:   'custpage_selected_total',
+                type: serverWidget.FieldType.INLINEHTML,
+                label: ' '
+            });
+            totalBadgeField.defaultValue = `
+                <style>
+                    #giv_total_badge {
+                        display: inline-block;
+                        background: #777;
+                        color: #fff;
+                        font-weight: 600;
+                        font-size: 13px;
+                        padding: 5px 16px;
+                        border-radius: 20px;
+                        margin: 4px 0 8px 0;
+                        letter-spacing: 0.3px;
+                        transition: background 0.3s;
+                    }
+                </style>
+                <span id="giv_total_badge">Total seleccionado: 0.00</span>`;
+
             // ── Sublista: Reembolsos Disponibles ──
             const sourceSublist = form.addSublist({
                 id: 'custpage_source_sublist',
@@ -126,6 +149,10 @@ define([
             sourceSublist.addField({ id: 'custpage_src_amount', type: serverWidget.FieldType.CURRENCY, label: LBL.SRC_AMOUNT })
                 .updateDisplayType({ displayType: serverWidget.FieldDisplayType.ENTRY });
             sourceSublist.addField({ id: 'custpage_src_currency', type: serverWidget.FieldType.TEXT, label: LBL.CURRENCY });
+
+            // ── Botones de selección masiva (dentro del toolbar de la sublista) ──
+            sourceSublist.addButton({ id: 'custpage_select_all',   label: LBL.BTN_SELECT_ALL   || 'Seleccionar Todas', functionName: 'selectAllProvisions'   });
+            sourceSublist.addButton({ id: 'custpage_deselect_all', label: LBL.BTN_DESELECT_ALL || 'Desmarcar Todas',   functionName: 'deselectAllProvisions' });
 
             // Campos ocultos
             sourceSublist.addField({ id: 'custpage_src_accrual_id', type: serverWidget.FieldType.TEXT, label: 'Accrual ID' }).updateDisplayType({ displayType: serverWidget.FieldDisplayType.HIDDEN });
@@ -320,7 +347,9 @@ define([
                     sublist.setSublistValue({ id: 'custpage_src_agreement_id', line: index, value: safeValue(accrual.agreementId, '0') });
                     sublist.setSublistValue({ id: 'custpage_src_invoice_id', line: index, value: safeValue(accrual.invoiceId, '0') });
                     sublist.setSublistValue({ id: 'custpage_src_item_id', line: index, value: safeValue(accrual.itemId, '0') });
-                    sublist.setSublistValue({ id: 'custpage_src_sett_method', line: index, value: safeValue(accrual.settlementMethod, '2') });
+                    // [FIX] Fallback era '2' — incorrecto. '0' fuerza al script a leer el método
+                    // del header (custpage_settlement_method) si el accrual no trae el dato.
+                    sublist.setSublistValue({ id: 'custpage_src_sett_method', line: index, value: safeValue(accrual.settlementMethod, '0') });
                     sublist.setSublistValue({ id: 'custpage_src_payer_id', line: index, value: safeValue(accrual.payerId, '0') });
                     sublist.setSublistValue({ id: 'custpage_src_acct_item', line: index, value: safeValue(accrual.accountingItem, '0') });
                 } catch (lineError) {
@@ -435,7 +464,14 @@ define([
                 }
             }
 
-            const settlementMethod = sourceLines.length > 0 ? sourceLines[0].settlementMethod : '';
+            // [FIX] Fuente autoritativa del settlement method: si la línea trae '0'/vacío
+            // (por el fallback corregido), se toma del campo header que SÍ lo leeó del acuerdo.
+            const headerSettlementMethod = request.parameters.custpage_settlement_method || '';
+            const rawLineMethod = sourceLines.length > 0 ? sourceLines[0].settlementMethod : '';
+            const settlementMethod = (rawLineMethod && rawLineMethod !== '0')
+                ? rawLineMethod
+                : headerSettlementMethod;
+
 
             /**
              * Helper interno: redirige al dashboard GET con el error en la URL.
@@ -476,13 +512,14 @@ define([
                 }
             }
 
-            // Validación de concurrencia en tiempo real
+            // Validación de concurrencia + bloqueo de monto > disponible en tiempo real
             for (const srcLine of sourceLines) {
                 const concurrencyCheck = validator.validateAvailableAmount(
                     srcLine.accrualId,
                     srcLine.sourceItemId,
                     parseFloat(srcLine.amountToSettle) || 0,
-                    scenario
+                    scenario,
+                    parseFloat(srcLine.availableAmount) || 0   // [FIX] pasar el saldo disponible
                 );
                 if (!concurrencyCheck.valid) {
                     redirectWithError([concurrencyCheck.message]);

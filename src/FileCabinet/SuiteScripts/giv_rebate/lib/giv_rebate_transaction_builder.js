@@ -34,8 +34,8 @@ define(['N/record', 'N/log', 'N/runtime'], (record, log, runtime) => {
                 }
             });
 
-            if (currency)  cmRec.setValue({ fieldId: 'currency',  value: currency });
-            if (location)  cmRec.setValue({ fieldId: 'location',  value: location });
+            if (currency) cmRec.setValue({ fieldId: 'currency', value: currency });
+            if (location) cmRec.setValue({ fieldId: 'location', value: location });
 
             // Escenario 9 (Agrupación): una sola línea con artículo contable genérico
             if (scenario === 'Agrupación' && accountingItemId) {
@@ -107,7 +107,7 @@ define(['N/record', 'N/log', 'N/runtime'], (record, log, runtime) => {
 
                     if (matchedApp) {
                         cmToApply.selectLine({ sublistId: 'apply', line: i });
-                        cmToApply.setCurrentSublistValue({ sublistId: 'apply', fieldId: 'apply',  value: true });
+                        cmToApply.setCurrentSublistValue({ sublistId: 'apply', fieldId: 'apply', value: true });
                         cmToApply.setCurrentSublistValue({ sublistId: 'apply', fieldId: 'amount', value: Math.round(parseFloat(matchedApp.amount) * 100) / 100 });
                         cmToApply.commitLine({ sublistId: 'apply' });
                         appliedCount++;
@@ -154,8 +154,8 @@ define(['N/record', 'N/log', 'N/runtime'], (record, log, runtime) => {
                 }
             });
 
-            if (currency)  vbRec.setValue({ fieldId: 'currency',  value: currency });
-            if (location)  vbRec.setValue({ fieldId: 'location',  value: location });
+            if (currency) vbRec.setValue({ fieldId: 'currency', value: currency });
+            if (location) vbRec.setValue({ fieldId: 'location', value: location });
 
             lines.forEach((line) => {
                 vbRec.selectNewLine({ sublistId: 'item' });
@@ -237,7 +237,7 @@ define(['N/record', 'N/log', 'N/runtime'], (record, log, runtime) => {
                 workRec.setValue({ fieldId: 'custrecord_giv_lw_tax_basis', value: parseFloat(data.taxBasis) || 0 });
             }
             if (data.excessFlag) {
-                workRec.setValue({ fieldId: 'custrecord_giv_lw_excess_flag', value: 'T' });
+                workRec.setValue({ fieldId: 'custrecord_giv_lw_excess_flag', value: true });
             }
             if (data.csvBatchId) {
                 workRec.setValue({ fieldId: 'custrecord_giv_lw_csv_batch_id', value: data.csvBatchId });
@@ -349,24 +349,26 @@ define(['N/record', 'N/log', 'N/runtime'], (record, log, runtime) => {
         try {
             const values = {};
 
-            if (updates.status) values['custrecord_giv_lw_proc_status'] = updates.status;
-            if (updates.errorMessage !== undefined) values['custrecord_giv_lw_error_message'] = updates.errorMessage;
-            if (updates.processedTransaction) values['custrecord_giv_lw_processed_tran'] = updates.processedTransaction;
+            if (updates.status)                       values['custrecord_giv_lw_proc_status']     = updates.status;
+            if (updates.errorMessage !== undefined)   values['custrecord_giv_lw_error_message']   = updates.errorMessage;
+            if (updates.processedTransaction)         values['custrecord_giv_lw_processed_tran']  = updates.processedTransaction;
+            // [FIX] Monto prorrateado real usado en el Credit Memo (Cobro en exceso)
+            if (updates.proratedAmount !== undefined) values['custrecord_giv_lw_amt_to_settle']   = parseFloat(updates.proratedAmount) || 0;
 
             record.submitFields({
                 type: 'customrecord_giv_rebate_liq_work',
-                id: workId,
+                id:   workId,
                 values: values
             });
 
             log.debug({
-                title: `${MODULE}.updateWorkRecord`,
+                title:   `${MODULE}.updateWorkRecord`,
                 details: `Updated WORK ${workId}: ${JSON.stringify(updates)}`
             });
 
         } catch (e) {
             log.error({
-                title: `${MODULE}.updateWorkRecord`,
+                title:   `${MODULE}.updateWorkRecord`,
                 details: `WorkId: ${workId}. Error: ${e.message}`
             });
             throw e;
