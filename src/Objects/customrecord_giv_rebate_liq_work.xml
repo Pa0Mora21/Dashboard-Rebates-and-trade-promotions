@@ -42,8 +42,8 @@
 
     <customrecordcustomfield scriptid="custrecord_giv_lw_source_accrual">
       <label>Source Accrual</label>
-      <fieldtype>SELECT</fieldtype>
-      <selectrecordtype>-30</selectrecordtype>
+      <fieldtype>INTEGER</fieldtype>
+      <!-- customrecord_rm_accruals pertenece a SuiteApp gestionada; se almacena el ID numérico directamente -->
       <ismandatory>T</ismandatory>
       <displaytype>NORMAL</displaytype>
     </customrecordcustomfield>

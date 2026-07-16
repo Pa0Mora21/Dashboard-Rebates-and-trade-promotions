@@ -127,8 +127,16 @@ define([], () => {
         }
     };
 
+    // Valores nativos de NetSuite para custrecord_rm_settlement_method
+    // en customrecord_rm_sales_transaction (Rebate Agreement)
+    const SETTLEMENT_METHOD = {
+        CREDIT_MEMO:  3,   // Nota de Crédito (Credit Memo / Credit Note)
+        VENDOR_BILL:  1    // Factura de proveedor (Vendor Bill / Vendor Invoice)
+    };
+
     return {
         LABELS,
-        getLabels
+        getLabels,
+        SETTLEMENT_METHOD
     };
 });

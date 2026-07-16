@@ -25,21 +25,23 @@ define(['N/url', 'N/currentRecord'], (url, currentRecord) => {
         if (sublistId === 'custpage_source_sublist' && fieldId === 'custpage_src_select') {
             const line = context.line;
             const isSelected = rec.getSublistValue({ sublistId, fieldId, line });
-            
+
             // Seleccionar la línea para poder editarla
             rec.selectLine({ sublistId, line });
 
             if (isSelected) {
-                // Si se selecciona, copiar el saldo disponible al monto a liquidar (usar 0 si está vacío)
-                let available = rec.getSublistValue({ sublistId, fieldId: 'custpage_src_available', line });
+                // Si se selecciona, copiar el saldo disponible al monto a liquidar
+                let available = rec.getCurrentSublistValue({ sublistId, fieldId: 'custpage_src_available' });
                 available = parseFloat(available) || 0;
                 rec.setCurrentSublistValue({ sublistId, fieldId: 'custpage_src_amount', value: available, ignoreFieldChange: true });
             } else {
                 // Si se deselecciona, limpiar el monto
                 rec.setCurrentSublistValue({ sublistId, fieldId: 'custpage_src_amount', value: 0, ignoreFieldChange: true });
             }
-            
-            // No hacemos commitLine porque es una sublista de tipo LIST (estática)
+
+            // commitLine es necesario para que getSublistValue en saveRecord lea el valor actualizado.
+            // Sin commitLine, el valor queda uncommitted y la validación lee 0.
+            rec.commitLine({ sublistId });
         }
     };
 
@@ -58,11 +60,14 @@ define(['N/url', 'N/currentRecord'], (url, currentRecord) => {
         try {
             const rec = currentRecord.get();
 
+            // Leer valores — MULTISELECT retorna array de internal IDs
+            const customerValue = rec.getValue({ fieldId: 'custpage_customer' });
             const agreementId = rec.getValue({ fieldId: 'custpage_agreement' });
             const scenario = rec.getValue({ fieldId: 'custpage_scenario' });
             const dateFrom = rec.getText({ fieldId: 'custpage_date_from' });
             const dateTo = rec.getText({ fieldId: 'custpage_date_to' });
-            const itemId = rec.getValue({ fieldId: 'custpage_item' });
+            const itemValue = rec.getValue({ fieldId: 'custpage_item' });
+            const invoiceValue = rec.getValue({ fieldId: 'custpage_source_invoice' });
 
             // DRD: Escenario es obligatorio
             if (!scenario) {
@@ -70,18 +75,31 @@ define(['N/url', 'N/currentRecord'], (url, currentRecord) => {
                 return;
             }
 
-            // Debe haber al menos un filtro (acuerdo o cliente)
-            if (!agreementId) {
-                alert('Debe seleccionar un Acuerdo de Reembolso.');
+            // Debe haber al menos un filtro: acuerdo, cliente o factura origen
+            const hasAgreement = !!agreementId;
+            const hasCustomer = Array.isArray(customerValue) ? customerValue.filter(Boolean).length > 0 : !!customerValue;
+            const hasInvoice = Array.isArray(invoiceValue) ? invoiceValue.filter(Boolean).length > 0 : !!invoiceValue;
+            const hasItem = Array.isArray(itemValue) ? itemValue.filter(Boolean).length > 0 : !!itemValue;
+
+            if (!hasAgreement && !hasCustomer && !hasInvoice && !hasItem) {
+                alert('Debe seleccionar al menos un filtro: Acuerdo de Reembolso, Cliente o Factura Origen.');
                 return;
             }
 
+            // Serializar arrays con separador U+0005 (convención NetSuite para MULTISELECT en URL)
+            const toParam = (val) => {
+                if (!val) return '';
+                return Array.isArray(val) ? val.filter(Boolean).join('\u0005') : String(val);
+            };
+
             const params = {
-                custpage_agreement: Array.isArray(agreementId) ? agreementId.join('\u0005') : agreementId,
+                custpage_customer: toParam(customerValue),
+                custpage_agreement: toParam(agreementId),
                 custpage_date_from: dateFrom || '',
                 custpage_date_to: dateTo || '',
                 custpage_scenario: scenario,
-                custpage_item: itemId || ''
+                custpage_item: toParam(itemValue),
+                custpage_source_invoice: toParam(invoiceValue)
             };
 
             const suiteletUrl = url.resolveScript({
@@ -100,21 +118,21 @@ define(['N/url', 'N/currentRecord'], (url, currentRecord) => {
 
     /**
      * Valida antes de enviar el formulario para procesar liquidación.
-     * DRD Sección 5: Validaciones antes de crear WORK records.
+     * DRD Sección 4 y 5: Validaciones antes de crear WORK records.
      */
     const saveRecord = (context) => {
+        const CREDIT_MEMO_METHOD = 3;  // Valor nativo NetSuite — Credit Memo
         const rec = currentRecord.get();
 
-        // Verificar que haya al menos una línea seleccionada
-        const lineCount = rec.getLineCount({ sublistId: 'custpage_source_sublist' });
+        // Leer el método de liquidación del acuerdo (hidden field)
+        const settlementMethod = parseInt(rec.getValue({ fieldId: 'custpage_settlement_method' })) || null;
+        const isCreditMemo = (settlementMethod === CREDIT_MEMO_METHOD);
+
+        // ── Validar sublista ORIGEN ──
+        const srcCount = rec.getLineCount({ sublistId: 'custpage_source_sublist' });
         let hasSelected = false;
-        for (let i = 0; i < lineCount; i++) {
-            const selected = rec.getSublistValue({
-                sublistId: 'custpage_source_sublist',
-                fieldId: 'custpage_src_select',
-                line: i
-            });
-            if (selected) {
+        for (let i = 0; i < srcCount; i++) {
+            if (rec.getSublistValue({ sublistId: 'custpage_source_sublist', fieldId: 'custpage_src_select', line: i })) {
                 hasSelected = true;
                 break;
             }
@@ -125,25 +143,36 @@ define(['N/url', 'N/currentRecord'], (url, currentRecord) => {
             return false;
         }
 
-        // Verificar montos ingresados
-        for (let i = 0; i < lineCount; i++) {
-            const selected = rec.getSublistValue({
-                sublistId: 'custpage_source_sublist',
-                fieldId: 'custpage_src_select',
-                line: i
-            });
+        // Verificar montos en origen
+        for (let i = 0; i < srcCount; i++) {
+            const selected = rec.getSublistValue({ sublistId: 'custpage_source_sublist', fieldId: 'custpage_src_select', line: i });
             if (selected) {
-                const amount = parseFloat(rec.getSublistValue({
-                    sublistId: 'custpage_source_sublist',
-                    fieldId: 'custpage_src_amount',
-                    line: i
-                })) || 0;
-
+                const amount = parseFloat(rec.getSublistValue({ sublistId: 'custpage_source_sublist', fieldId: 'custpage_src_amount', line: i })) || 0;
                 if (amount <= 0) {
                     alert(`La línea ${i + 1} seleccionada no tiene monto a liquidar.`);
                     return false;
                 }
             }
+        }
+
+        // ── DRD Punto 4: Validar sublista DESTINO según método ──
+        const dstCount = rec.getLineCount({ sublistId: 'custpage_dest_sublist' });
+        let hasDstSelected = false;
+        for (let j = 0; j < dstCount; j++) {
+            if (rec.getSublistValue({ sublistId: 'custpage_dest_sublist', fieldId: 'custpage_dst_select', line: j })) {
+                hasDstSelected = true;
+                break;
+            }
+        }
+
+        if (isCreditMemo && !hasDstSelected) {
+            alert('El acuerdo utiliza Credit Memo. Debe seleccionar al menos una factura destino.');
+            return false;
+        }
+
+        if (!isCreditMemo && settlementMethod !== null && hasDstSelected) {
+            alert('El acuerdo utiliza Vendor Bill. No debe seleccionar facturas destino.');
+            return false;
         }
 
         return true;

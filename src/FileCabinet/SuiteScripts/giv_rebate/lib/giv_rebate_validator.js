@@ -74,7 +74,8 @@ define(['N/log', './giv_rebate_dao'], (log, dao) => {
             errors.push('Debe seleccionar al menos una provisión para liquidar.');
         }
 
-        if (settlementMethod === '2') {
+        // settlementMethod '3' = Credit Memo (valor real en custrecord_rm_settlement_method)
+        if (settlementMethod === '3') {
             if ((!destLines || destLines.length === 0) && scenario !== 'Cobro en exceso') {
                 errors.push('Debe seleccionar al menos una factura destino para liquidaciones por Credit Memo.');
             }

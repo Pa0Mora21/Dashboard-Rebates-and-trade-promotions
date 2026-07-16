@@ -22,7 +22,8 @@ define(['N/record', 'N/log', 'N/runtime'], (record, log, runtime) => {
                 scenario,
                 accountingItemId,
                 taxDetailsLines,
-                currency
+                currency,
+                location
             } = params;
 
             const cmRec = record.create({
@@ -33,9 +34,8 @@ define(['N/record', 'N/log', 'N/runtime'], (record, log, runtime) => {
                 }
             });
 
-            if (currency) {
-                cmRec.setValue({ fieldId: 'currency', value: currency });
-            }
+            if (currency)  cmRec.setValue({ fieldId: 'currency',  value: currency });
+            if (location)  cmRec.setValue({ fieldId: 'location',  value: location });
 
             // Escenario 9 (Agrupación): una sola línea con artículo contable genérico
             if (scenario === 'Agrupación' && accountingItemId) {
@@ -77,26 +77,50 @@ define(['N/record', 'N/log', 'N/runtime'], (record, log, runtime) => {
                 });
             }
 
-            // Aplicación automática contra facturas destino
-            if (invoiceApplications && invoiceApplications.length > 0) {
-                const applyCount = cmRec.getLineCount({ sublistId: 'apply' });
-                for (let i = 0; i < applyCount; i++) {
-                    const applyInvoiceId = cmRec.getSublistValue({ sublistId: 'apply', fieldId: 'internalid', line: i });
-
-                    const matchedApp = invoiceApplications.find(app => String(app.invoiceId) === String(applyInvoiceId));
-                    if (matchedApp) {
-                        cmRec.setSublistValue({ sublistId: 'apply', fieldId: 'apply', line: i, value: true });
-                        cmRec.setSublistValue({ sublistId: 'apply', fieldId: 'amount', line: i, value: Math.round(parseFloat(matchedApp.amount) * 100) / 100 });
-                    }
-                }
-            }
-
+            // ── FASE 1: Guardar el CM SIN aplicar a facturas ──────────────────────────
+            // La localización AT Mexico requiere que los impuestos estén calculados
+            // ANTES de poder asignar montos en el sublist 'apply'. El save() dispara
+            // ese cálculo internamente (equivalente al botón "Preview Tax" en la UI).
             const creditMemoId = cmRec.save({ enableSourcing: true, ignoreMandatoryFields: false });
 
             log.audit({
                 title: `${MODULE}.createCreditMemo`,
-                details: `Created CM ${creditMemoId} for customer ${customerId}, scenario ${scenario}, ${lines.length} lines`
+                details: `Phase 1 — Created CM ${creditMemoId} for customer ${customerId}, scenario ${scenario}, ${lines.length} lines`
             });
+
+            // ── FASE 2: Cargar el CM guardado y aplicar contra facturas destino ───────
+            // Solo si hay facturas destino. El reload garantiza que los impuestos
+            // AT ya están calculados y el sublist 'apply' acepta los montos.
+            if (invoiceApplications && invoiceApplications.length > 0) {
+                const cmToApply = record.load({
+                    type: record.Type.CREDIT_MEMO,
+                    id: creditMemoId,
+                    isDynamic: true
+                });
+
+                const applyCount = cmToApply.getLineCount({ sublistId: 'apply' });
+                let appliedCount = 0;
+
+                for (let i = 0; i < applyCount; i++) {
+                    const applyInvoiceId = cmToApply.getSublistValue({ sublistId: 'apply', fieldId: 'internalid', line: i });
+                    const matchedApp = invoiceApplications.find(app => String(app.invoiceId) === String(applyInvoiceId));
+
+                    if (matchedApp) {
+                        cmToApply.selectLine({ sublistId: 'apply', line: i });
+                        cmToApply.setCurrentSublistValue({ sublistId: 'apply', fieldId: 'apply',  value: true });
+                        cmToApply.setCurrentSublistValue({ sublistId: 'apply', fieldId: 'amount', value: Math.round(parseFloat(matchedApp.amount) * 100) / 100 });
+                        cmToApply.commitLine({ sublistId: 'apply' });
+                        appliedCount++;
+                    }
+                }
+
+                cmToApply.save({ enableSourcing: true, ignoreMandatoryFields: false });
+
+                log.audit({
+                    title: `${MODULE}.createCreditMemo`,
+                    details: `Phase 2 — Applied CM ${creditMemoId} to ${appliedCount} invoice(s)`
+                });
+            }
 
             return creditMemoId;
 
@@ -107,6 +131,7 @@ define(['N/record', 'N/log', 'N/runtime'], (record, log, runtime) => {
             });
             throw e;
         }
+
     };
 
     /**
@@ -115,7 +140,7 @@ define(['N/record', 'N/log', 'N/runtime'], (record, log, runtime) => {
      */
     const createVendorBill = (params) => {
         try {
-            const { vendorId, lines, currency } = params;
+            const { vendorId, lines, currency, location } = params;
 
             if (!vendorId) {
                 throw new Error('El acuerdo de reembolso no tiene configurada la entidad pagadora (custrecord_hidden_payer).');
@@ -129,9 +154,8 @@ define(['N/record', 'N/log', 'N/runtime'], (record, log, runtime) => {
                 }
             });
 
-            if (currency) {
-                vbRec.setValue({ fieldId: 'currency', value: currency });
-            }
+            if (currency)  vbRec.setValue({ fieldId: 'currency',  value: currency });
+            if (location)  vbRec.setValue({ fieldId: 'location',  value: location });
 
             lines.forEach((line) => {
                 vbRec.selectNewLine({ sublistId: 'item' });
@@ -169,7 +193,7 @@ define(['N/record', 'N/log', 'N/runtime'], (record, log, runtime) => {
      * Crea un registro WORK a partir de datos de entrada.
      * Usa los field IDs cortos reales (custrecord_giv_lw_*).
      */
-    const createWorkRecord = (data, createdFrom) => {
+    const createWorkRecord = (data, createdFrom, options = {}) => {
         try {
             const workRec = record.create({ type: 'customrecord_giv_rebate_liq_work', isDynamic: true });
 
@@ -177,7 +201,10 @@ define(['N/record', 'N/log', 'N/runtime'], (record, log, runtime) => {
             workRec.setValue({ fieldId: 'custrecord_giv_lw_agreement', value: data.agreementId });
             workRec.setValue({ fieldId: 'custrecord_giv_lw_settle_method', value: data.settlementMethod });
             workRec.setValue({ fieldId: 'custrecord_giv_lw_scenario', value: data.scenario });
-            workRec.setValue({ fieldId: 'custrecord_giv_lw_source_accrual', value: data.sourceAccrualId });
+            if (data.sourceAccrualId) {
+                workRec.setValue({ fieldId: 'custrecord_giv_lw_source_accrual', value: data.sourceAccrualId });
+            }
+
             workRec.setValue({ fieldId: 'custrecord_giv_lw_original_amt', value: parseFloat(data.originalAmount) || 0 });
             workRec.setValue({ fieldId: 'custrecord_giv_lw_available_amt', value: parseFloat(data.availableAmount) || 0 });
             workRec.setValue({ fieldId: 'custrecord_giv_lw_amt_to_settle', value: parseFloat(data.amountToSettle) || 0 });
@@ -216,7 +243,11 @@ define(['N/record', 'N/log', 'N/runtime'], (record, log, runtime) => {
                 workRec.setValue({ fieldId: 'custrecord_giv_lw_csv_batch_id', value: data.csvBatchId });
             }
 
-            const workId = workRec.save({ enableSourcing: false, ignoreMandatoryFields: false });
+            const workId = workRec.save({
+                enableSourcing: false,
+                ignoreMandatoryFields: options.ignoreMandatoryFields === true
+            });
+
 
             log.debug({
                 title: `${MODULE}.createWorkRecord`,

@@ -152,30 +152,40 @@ define([
             // Obtener detalles del acuerdo
             const agreement = dao.getAgreement(agreementId);
 
+            // ── Location: heredar de la factura origen (primer registro que tenga sourceInvoiceId) ──
+            // IMPORTANTE: no usar siempre firstRecord — en Consolidada puede ser un registro
+            // de destino (sourceInvoiceId vacío). Se busca el primer registro con sourceInvoiceId real.
+            let locationId = '';
+            const firstSourceRecord = workRecords.find(wr => wr.sourceInvoiceId) || null;
+            if (firstSourceRecord) {
+                try {
+                    const invFields = record.lookupFields({
+                        type: record.Type.INVOICE,
+                        id:   firstSourceRecord.sourceInvoiceId,
+                        columns: ['location']
+                    });
+                    locationId = invFields.location?.[0]?.value || '';
+                } catch (le) {
+                    log.debug({ title: `${MODULE}.reduce.location`, details: `No se pudo leer location de invoice ${firstSourceRecord.sourceInvoiceId}: ${le.message}` });
+                }
+            }
+
+            // Fallback: Script Parameter "Default Location"
+            if (!locationId) {
+                locationId = runtime.getCurrentScript().getParameter({ name: 'custscript_giv_mr_default_location' }) || '';
+                if (locationId) {
+                    log.debug({ title: `${MODULE}.reduce.location`, details: `Usando Default Location del Script Parameter: ${locationId}` });
+                } else {
+                    log.audit({ title: `${MODULE}.reduce.location`, details: 'ADVERTENCIA: No se encontró Location en la factura origen ni en el Script Parameter. Si Location es obligatoria, el CM/VB fallará.' });
+                }
+            }
+
             let generatedTxnId = '';
             let transactionType = '';
 
             // ── Procesar según método de liquidación ──
+            // Credit Memo = '3' | Vendor Bill = '1'  (constante SETTLEMENT_METHOD)
             if (settlementMethod === '3') {
-                // ── VENDOR BILL ──
-                if (!agreement || !agreement.payer_id) {
-                    throw new Error('El acuerdo de reembolso no tiene configurada la entidad pagadora (custrecord_hidden_payer).');
-                }
-
-                const vbLines = workRecords.map(wr => ({
-                    itemId: agreement.accounting_item,
-                    amount: parseFloat(wr.amountToSettle) || 0,
-                    taxCodeId: wr.taxCodeId,
-                    description: `Liquidación rebate - Acuerdo ${agreementId}`
-                }));
-
-                generatedTxnId = txnBuilder.createVendorBill({
-                    vendorId: agreement.payer_id,
-                    lines: vbLines
-                });
-                transactionType = 'Vendor Bill';
-
-            } else {
                 // ── CREDIT MEMO ──
                 let cmLines = [];
                 let invoiceApplications = [];
@@ -193,16 +203,20 @@ define([
                     const enriched = taxUtils.enrichWithTaxInfo(workRecords);
                     taxDetailsLines = taxUtils.buildTaxDetailsOverride(enriched);
 
-                    cmLines = workRecords.map(wr => ({
-                        itemId: agreement.accounting_item,
-                        amount: parseFloat(wr.amountToSettle) || 0
-                    }));
+                    // Solo registros de fuente (amountToSettle > 0) contribuyen al CM
+                    cmLines = workRecords
+                        .filter(wr => parseFloat(wr.amountToSettle) > 0)
+                        .map(wr => ({
+                            itemId: agreement.accounting_item,
+                            amount: parseFloat(wr.amountToSettle) || 0
+                        }));
 
                 } else if (scenario === 'Cobro en exceso') {
-                    // Escenario 4 — Prorrateo del excedente entre líneas
-                    const totalRequested = workRecords.reduce((sum, wr) => sum + (parseFloat(wr.amountToSettle) || 0), 0);
+                    // Escenario 4 — Prorrateo del excedente entre líneas de fuente
+                    const sourceWorkRecords = workRecords.filter(wr => parseFloat(wr.amountToSettle) > 0);
+                    const totalRequested = sourceWorkRecords.reduce((sum, wr) => sum + (parseFloat(wr.amountToSettle) || 0), 0);
 
-                    const linesForProration = workRecords.map(wr => ({
+                    const linesForProration = sourceWorkRecords.map(wr => ({
                         ...wr,
                         provisionAmount: parseFloat(wr.availableAmount) || 0
                     }));
@@ -224,13 +238,15 @@ define([
                     });
 
                 } else {
-                    // Escenarios 1, 2, 3
-                    cmLines = workRecords.map(wr => ({
-                        itemId: agreement.accounting_item,
-                        amount: parseFloat(wr.amountToSettle) || 0,
-                        taxCodeId: wr.taxCodeId,
-                        description: `Liquidación rebate - Acuerdo ${agreementId}`
-                    }));
+                    // Escenarios 1, 2, 3 — solo registros de fuente (amountToSettle > 0) al CM
+                    cmLines = workRecords
+                        .filter(wr => parseFloat(wr.amountToSettle) > 0)
+                        .map(wr => ({
+                            itemId: agreement.accounting_item,
+                            amount: parseFloat(wr.amountToSettle) || 0,
+                            taxCodeId: wr.taxCodeId,
+                            description: `Liquidación rebate - Acuerdo ${agreementId}`
+                        }));
                 }
 
                 // Preparar aplicación de facturas destino
@@ -250,14 +266,35 @@ define([
                 }));
 
                 generatedTxnId = txnBuilder.createCreditMemo({
-                    customerId: customerId,
-                    lines: cmLines,
+                    customerId:       customerId,
+                    lines:            cmLines,
                     invoiceApplications: invoiceApplications,
-                    scenario: scenario,
+                    scenario:         scenario,
                     accountingItemId: accountingItemId,
-                    taxDetailsLines: taxDetailsLines
+                    taxDetailsLines:  taxDetailsLines,
+                    location:         locationId
                 });
                 transactionType = 'Credit Memo';
+
+            } else {
+                // ── VENDOR BILL ──
+                if (!agreement || !agreement.payer_id) {
+                    throw new Error('El acuerdo de reembolso no tiene configurada la entidad pagadora (custrecord_hidden_payer).');
+                }
+
+                const vbLines = workRecords.map(wr => ({
+                    itemId: agreement.accounting_item,
+                    amount: parseFloat(wr.amountToSettle) || 0,
+                    taxCodeId: wr.taxCodeId,
+                    description: `Liquidación rebate - Acuerdo ${agreementId}`
+                }));
+
+                generatedTxnId = txnBuilder.createVendorBill({
+                    vendorId:  agreement.payer_id,
+                    lines:     vbLines,
+                    location:  locationId
+                });
+                transactionType = 'Vendor Bill';
             }
 
             // ── Actualizar WORK a Completado y crear History ──
