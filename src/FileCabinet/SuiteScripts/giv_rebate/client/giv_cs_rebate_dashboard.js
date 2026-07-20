@@ -229,24 +229,30 @@ define(['N/url', 'N/currentRecord'], (url, currentRecord) => {
                 badge.style.background  = totalSelected > 0 ? '#1a7f4b' : '#777';
             }
 
-            // ── Auto-distribuir si hay exactamente 1 factura destino seleccionada ──
-            const dstCount = rec.getLineCount({ sublistId: DST_SUBLIST });
-            const selectedDstLines = [];
-            for (let j = 0; j < dstCount; j++) {
-                if (rec.getSublistValue({ sublistId: DST_SUBLIST, fieldId: 'custpage_dst_select', line: j })) {
-                    selectedDstLines.push(j);
-                }
-            }
+            const scenario = rec.getValue({ fieldId: 'custpage_scenario' });
 
-            if (selectedDstLines.length === 1) {
-                rec.selectLine({ sublistId: DST_SUBLIST, line: selectedDstLines[0] });
-                rec.setCurrentSublistValue({
-                    sublistId:          DST_SUBLIST,
-                    fieldId:            'custpage_dst_amount',
-                    value:              totalSelected.toFixed(2),
-                    ignoreFieldChange:  true
-                });
-                rec.commitLine({ sublistId: DST_SUBLIST });
+            // ── Estándar: la redistribución posicional la maneja redistributeStandardDest ──
+            // No aplicar auto-fill de total aquí para evitar sobreescribir los montos 1:1.
+            if (scenario !== SCENARIOS.STANDARD) {
+                // ── Auto-distribuir si hay exactamente 1 factura destino seleccionada ──
+                const dstCount = rec.getLineCount({ sublistId: DST_SUBLIST });
+                const selectedDstLines = [];
+                for (let j = 0; j < dstCount; j++) {
+                    if (rec.getSublistValue({ sublistId: DST_SUBLIST, fieldId: 'custpage_dst_select', line: j })) {
+                        selectedDstLines.push(j);
+                    }
+                }
+
+                if (selectedDstLines.length === 1) {
+                    rec.selectLine({ sublistId: DST_SUBLIST, line: selectedDstLines[0] });
+                    rec.setCurrentSublistValue({
+                        sublistId:          DST_SUBLIST,
+                        fieldId:            'custpage_dst_amount',
+                        value:              totalSelected.toFixed(2),
+                        ignoreFieldChange:  true
+                    });
+                    rec.commitLine({ sublistId: DST_SUBLIST });
+                }
             }
 
             // ── Sugerir escenario basado en las líneas seleccionadas ──
@@ -254,6 +260,59 @@ define(['N/url', 'N/currentRecord'], (url, currentRecord) => {
 
         } catch (e) {
             console.error(`${MODULE}.recalcTotals: ${e.message}`);
+        }
+    };
+
+    // ─────────────────────────────────────────────────────────────────────────
+    //  redistributeStandardDest — Solo Escenario Estándar + Credit Memo
+    //  Asigna automáticamente el monto de cada provisión seleccionada (por orden
+    //  de fila) a la factura destino seleccionada en la misma posición.
+    //  Resultado visual: el usuario ve en tiempo real qué monto irá a cada destino.
+    // ─────────────────────────────────────────────────────────────────────────
+    /**
+     * @param {Object} rec - currentRecord
+     */
+    const redistributeStandardDest = (rec) => {
+        try {
+            const scenario        = rec.getValue({ fieldId: 'custpage_scenario' });
+            const settlementMethod = parseInt(rec.getValue({ fieldId: 'custpage_settlement_method' })) || null;
+
+            // Solo aplica en Estándar + Credit Memo
+            if (scenario !== SCENARIOS.STANDARD || settlementMethod !== 3) return;
+
+            // ── Recolectar montos de orígenes seleccionados (en orden de fila) ──
+            const srcCount = rec.getLineCount({ sublistId: SRC_SUBLIST });
+            const selectedSrcAmounts = [];
+            for (let i = 0; i < srcCount; i++) {
+                if (rec.getSublistValue({ sublistId: SRC_SUBLIST, fieldId: 'custpage_src_select', line: i })) {
+                    const amount = parseFloat(rec.getSublistValue({ sublistId: SRC_SUBLIST, fieldId: 'custpage_src_amount', line: i })) || 0;
+                    selectedSrcAmounts.push(amount);
+                }
+            }
+
+            // ── Distribuir a destinos seleccionados (en orden de fila) ──
+            // destino[0] recibe monto de origen[0], destino[1] de origen[1], etc.
+            const dstCount = rec.getLineCount({ sublistId: DST_SUBLIST });
+            let pairIndex = 0;
+            for (let j = 0; j < dstCount; j++) {
+                if (rec.getSublistValue({ sublistId: DST_SUBLIST, fieldId: 'custpage_dst_select', line: j })) {
+                    const amount = selectedSrcAmounts[pairIndex] !== undefined
+                        ? selectedSrcAmounts[pairIndex]
+                        : 0;
+                    rec.selectLine({ sublistId: DST_SUBLIST, line: j });
+                    rec.setCurrentSublistValue({
+                        sublistId:         DST_SUBLIST,
+                        fieldId:           'custpage_dst_amount',
+                        value:             amount.toFixed(2),
+                        ignoreFieldChange: true
+                    });
+                    rec.commitLine({ sublistId: DST_SUBLIST });
+                    pairIndex++;
+                }
+            }
+
+        } catch (e) {
+            console.error(`${MODULE}.redistributeStandardDest: ${e.message}`);
         }
     };
 
@@ -291,16 +350,38 @@ define(['N/url', 'N/currentRecord'], (url, currentRecord) => {
             // commitLine: necesario para que saveRecord/getSublistValue lean el valor actualizado
             rec.commitLine({ sublistId });
             recalcTotals(rec);
+            // Estándar: al cambiar un origen, redistribuir montos a destinos emparejados
+            redistributeStandardDest(rec);
         }
 
-        // ── Ajuste manual del monto de provisión → recalcular total ──
+        // ── Ajuste manual del monto de provisión → recalcular total y redistribuir ──
         if (sublistId === SRC_SUBLIST && fieldId === 'custpage_src_amount') {
             recalcTotals(rec);
+            // Estándar: si el usuario ajusta manualmente el monto, reflejar en el destino par
+            redistributeStandardDest(rec);
         }
 
-        // ── Selección / deselección de factura destino → re-distribuir total ──
+        // ── Selección / deselección de factura destino ──
         if (sublistId === DST_SUBLIST && fieldId === 'custpage_dst_select') {
+            const line = context.line;
+            const isSelected = rec.getSublistValue({ sublistId, fieldId: 'custpage_dst_select', line });
+
+            if (!isSelected) {
+                // Al desmarcar → restaurar el monto al saldo abierto original
+                const openBalance = parseFloat(rec.getSublistValue({ sublistId, fieldId: 'custpage_dst_open', line })) || 0;
+                rec.selectLine({ sublistId, line });
+                rec.setCurrentSublistValue({
+                    sublistId,
+                    fieldId:           'custpage_dst_amount',
+                    value:             openBalance.toFixed(2),
+                    ignoreFieldChange: true
+                });
+                rec.commitLine({ sublistId });
+            }
+
             recalcTotals(rec);
+            // Estándar: reasignar montos a los destinos que siguen seleccionados
+            redistributeStandardDest(rec);
         }
     };
 
@@ -473,6 +554,11 @@ define(['N/url', 'N/currentRecord'], (url, currentRecord) => {
         }
 
         // ── DRD Punto 4: Validar sublista DESTINO según método ──
+        // Excepción: Cobro en exceso con CM no requiere factura destino (el CM se emite
+        // sin aplicar a una factura específica — el excedente se reconoce globalmente).
+        const scenario = rec.getValue({ fieldId: 'custpage_scenario' });
+        const isExcess  = (scenario === 'Cobro en exceso');
+
         const dstCount = rec.getLineCount({ sublistId: DST_SUBLIST });
         let hasDstSelected = false;
         for (let j = 0; j < dstCount; j++) {
@@ -482,7 +568,7 @@ define(['N/url', 'N/currentRecord'], (url, currentRecord) => {
             }
         }
 
-        if (isCreditMemo && !hasDstSelected) {
+        if (isCreditMemo && !hasDstSelected && !isExcess) {
             alert('El acuerdo utiliza Credit Memo. Debe seleccionar al menos una factura destino.');
             return false;
         }
@@ -490,6 +576,38 @@ define(['N/url', 'N/currentRecord'], (url, currentRecord) => {
         if (!isCreditMemo && settlementMethod !== null && hasDstSelected) {
             alert('El acuerdo utiliza Vendor Bill. No debe seleccionar facturas destino.');
             return false;
+        }
+
+        // ── DRD Escenario 1 — Estándar "uno a uno" ──────────────────────────────
+        // Cada línea origen debe emparejarse con exactamente una factura destino.
+        // Si el número de orígenes ≠ destinos, el procesamiento sería ambiguo.
+        if (isCreditMemo) {
+            if (scenario === 'Estándar') {
+                // Contar orígenes seleccionados
+                let selectedSrcCount = 0;
+                for (let i = 0; i < srcCount; i++) {
+                    if (rec.getSublistValue({ sublistId: SRC_SUBLIST, fieldId: 'custpage_src_select', line: i })) {
+                        selectedSrcCount++;
+                    }
+                }
+
+                // Contar destinos seleccionados
+                let selectedDstCount = 0;
+                for (let j = 0; j < dstCount; j++) {
+                    if (rec.getSublistValue({ sublistId: DST_SUBLIST, fieldId: 'custpage_dst_select', line: j })) {
+                        selectedDstCount++;
+                    }
+                }
+
+                if (selectedSrcCount !== selectedDstCount) {
+                    alert(
+                        `Escenario Estándar (uno a uno): debe seleccionar el mismo número de facturas origen y destino.\n` +
+                        `Seleccionados — Origen: ${selectedSrcCount}, Destino: ${selectedDstCount}.\n\n` +
+                        `Si necesita aplicar múltiples destinos para un mismo origen, utilice el escenario "Consolidada".`
+                    );
+                    return false;
+                }
+            }
         }
 
         return true;

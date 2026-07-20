@@ -319,6 +319,12 @@ define([
                     errorMessage:         ''
                 });
 
+                // WORK de destino (amountToSettle = 0): solo actualizar estado,
+                // no generar History porque no representan un accrual real.
+                // Aplica a Consolidada, Agrupación y Cobro en exceso cuando
+                // hay registros destino separados (en Estándar todos son > 0).
+                if (parseFloat(wr.amountToSettle) <= 0) return;
+
                 txnBuilder.createHistoryRecord({
                     customerId:             wr.customerId,
                     agreementId:            wr.agreementId,

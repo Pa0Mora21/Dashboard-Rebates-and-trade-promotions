@@ -163,25 +163,14 @@ define([
             sourceSublist.addField({ id: 'custpage_src_payer_id', type: serverWidget.FieldType.TEXT, label: 'Payer ID' }).updateDisplayType({ displayType: serverWidget.FieldDisplayType.HIDDEN });
             sourceSublist.addField({ id: 'custpage_src_acct_item', type: serverWidget.FieldType.TEXT, label: 'Acct Item' }).updateDisplayType({ displayType: serverWidget.FieldDisplayType.HIDDEN });
 
+
             // ── Sublista: Facturas Destino ──
-            const destSublist = form.addSublist({
-                id: 'custpage_dest_sublist',
-                type: serverWidget.SublistType.LIST,
-                label: LBL.DST_TITLE
-            });
+            // DRD: Solo se agrega al formulario si el método del acuerdo es Credit Memo.
+            // Para Vendor Bill el panel completo (encabezados, montos, checkbox) no se renderiza.
+            // Se declara null aquí y se inicializa más abajo, tras conocer el método.
+            let destSublist = null;
 
-            destSublist.addField({ id: 'custpage_dst_select', type: serverWidget.FieldType.CHECKBOX, label: LBL.SELECT });
-            destSublist.addField({ id: 'custpage_dst_invoice_id', type: serverWidget.FieldType.TEXT, label: 'Invoice ID' }).updateDisplayType({ displayType: serverWidget.FieldDisplayType.HIDDEN });
-            destSublist.addField({ id: 'custpage_dst_invoice', type: serverWidget.FieldType.TEXT, label: LBL.DST_INVOICE });
-            destSublist.addField({ id: 'custpage_dst_customer', type: serverWidget.FieldType.TEXT, label: LBL.DST_CUSTOMER });
-            destSublist.addField({ id: 'custpage_dst_date', type: serverWidget.FieldType.TEXT, label: LBL.DST_DATE });
-            destSublist.addField({ id: 'custpage_dst_total', type: serverWidget.FieldType.CURRENCY, label: LBL.DST_TOTAL });
-            destSublist.addField({ id: 'custpage_dst_open', type: serverWidget.FieldType.CURRENCY, label: LBL.DST_OPEN });
-            destSublist.addField({ id: 'custpage_dst_amount', type: serverWidget.FieldType.CURRENCY, label: LBL.DST_AMOUNT })
-                .updateDisplayType({ displayType: serverWidget.FieldDisplayType.ENTRY });
-            destSublist.addField({ id: 'custpage_dst_currency', type: serverWidget.FieldType.TEXT, label: LBL.CURRENCY });
 
-            // ── Poblar sublistas si hay filtros en la URL ──
             const params = context.request.parameters;
             log.debug({ title: `${MODULE}.renderDashboard - PARAMS RECEIVED`, details: JSON.stringify(params) });
 
@@ -247,6 +236,25 @@ define([
             });
             settlementMethodField.updateDisplayType({ displayType: serverWidget.FieldDisplayType.HIDDEN });
             if (settlementMethod) settlementMethodField.defaultValue = settlementMethod;
+
+            // DRD: Agregar sublista destino SOLO si el método es Credit Memo
+            if (settlementMethod === CONST.SETTLEMENT_METHOD.CREDIT_MEMO || settlementMethod === null) {
+                destSublist = form.addSublist({
+                    id: 'custpage_dest_sublist',
+                    type: serverWidget.SublistType.LIST,
+                    label: LBL.DST_TITLE
+                });
+                destSublist.addField({ id: 'custpage_dst_select', type: serverWidget.FieldType.CHECKBOX, label: LBL.SELECT });
+                destSublist.addField({ id: 'custpage_dst_invoice_id', type: serverWidget.FieldType.TEXT, label: 'Invoice ID' }).updateDisplayType({ displayType: serverWidget.FieldDisplayType.HIDDEN });
+                destSublist.addField({ id: 'custpage_dst_invoice', type: serverWidget.FieldType.TEXT, label: LBL.DST_INVOICE });
+                destSublist.addField({ id: 'custpage_dst_customer', type: serverWidget.FieldType.TEXT, label: LBL.DST_CUSTOMER });
+                destSublist.addField({ id: 'custpage_dst_date', type: serverWidget.FieldType.TEXT, label: LBL.DST_DATE });
+                destSublist.addField({ id: 'custpage_dst_total', type: serverWidget.FieldType.CURRENCY, label: LBL.DST_TOTAL });
+                destSublist.addField({ id: 'custpage_dst_open', type: serverWidget.FieldType.CURRENCY, label: LBL.DST_OPEN });
+                destSublist.addField({ id: 'custpage_dst_amount', type: serverWidget.FieldType.CURRENCY, label: LBL.DST_AMOUNT })
+                    .updateDisplayType({ displayType: serverWidget.FieldDisplayType.ENTRY });
+                destSublist.addField({ id: 'custpage_dst_currency', type: serverWidget.FieldType.TEXT, label: LBL.CURRENCY });
+            }
 
             if (hasFilters) {
                 const defaults = {};
@@ -536,7 +544,12 @@ define([
             const workIds = [];
             const isEstandardCM = settlementMethod === '3' && scenario === 'Estándar';
 
-            sourceLines.forEach((srcLine) => {
+            // ── DRD Escenario 1 "uno a uno": emparejamiento posicional ──
+            // Para Estándar+CM cada origen[i] se empareja con destino[i].
+            // La validación del client script garantiza que ambas listas tienen
+            // el mismo número de elementos antes de llegar aquí.
+
+            sourceLines.forEach((srcLine, srcIndex) => {
                 let taxInfo = { taxCodeId: '', taxRate: 0 };
                 if (srcLine.sourceInvoiceId && srcLine.sourceItemId) {
                     taxInfo = dao.getTaxInfoFromInvoiceLine(srcLine.sourceInvoiceId, srcLine.sourceItemId);
@@ -547,6 +560,8 @@ define([
                 // registro fuente para que el CM se aplique en el mismo reduce call.
                 // Para Consolidada/Agrupación/Exceso: los registros destino van separados
                 // (el reduce los agrupa todos bajo la misma key).
+                const pairedDest = isEstandardCM ? (destLines[srcIndex] || null) : null;
+
                 const workData = {
                     customerId:       customerId,
                     agreementId:      srcLine.agreementId,
@@ -563,9 +578,9 @@ define([
                     taxCodeId:        taxInfo.taxCodeId,
                     taxBasis:         srcLine.amountToSettle,
                     excessFlag:       scenario === 'Cobro en exceso',
-                    // Estándar: 1 fuente → 1 destino (primer destino o vacío si no aplica CM)
-                    invoiceTo:   isEstandardCM && destLines[0] ? destLines[0].invoiceId   || '' : '',
-                    applyAmount: isEstandardCM && destLines[0] ? destLines[0].applyAmount || '0' : '0'
+                    // Estándar: origen[i] ↔ destino[i] (emparejamiento posicional)
+                    invoiceTo:   pairedDest ? pairedDest.invoiceId   || '' : '',
+                    applyAmount: pairedDest ? pairedDest.applyAmount || '0' : '0'
                 };
 
                 const workId = txnBuilder.createWorkRecord(workData, 'Suitelet');
