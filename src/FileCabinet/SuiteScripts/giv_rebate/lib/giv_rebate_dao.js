@@ -254,7 +254,7 @@ WHERE rtd.isinactive = 'F'
             return results;
 
         } catch (e) {
-            log.error({ title: `${MODULE}.getAvailableAccruals`, details: e.message });
+            log.error({ title: `${MODULE}.getAvailableAccruals`, details: e.message || e });
             return [];
         }
     };
@@ -301,7 +301,7 @@ WHERE rtd.isinactive = 'F'
             return results;
 
         } catch (e) {
-            log.error({ title: `${MODULE}.getTransactionsByAgreement`, details: e.message });
+            log.error({ title: `${MODULE}.getTransactionsByAgreement`, details: e.message || e });
             return [];
         }
     };
@@ -349,7 +349,7 @@ WHERE rtd.isinactive = 'F'
             return result;
 
         } catch (e) {
-            log.error({ title: `${MODULE}.getCustomersByAgreement`, details: e.message });
+            log.error({ title: `${MODULE}.getCustomersByAgreement`, details: e.message || e });
             return [];
         }
     };
@@ -397,7 +397,7 @@ WHERE rtd.isinactive = 'F'
             return Math.abs(settledAmount);
 
         } catch (e) {
-            log.error({ title: `${MODULE}.getSettledAmountByAccrual`, details: e.message });
+            log.error({ title: `${MODULE}.getSettledAmountByAccrual`, details: e.message || e });
             // Si la tabla no existe aún (primera vez que se usa), retornar 0
             return 0;
         }
@@ -428,7 +428,7 @@ WHERE rtd.isinactive = 'F'
             return Math.abs(parseFloat(rows[0]?.returns_total) || 0);
 
         } catch (e) {
-            log.error({ title: `${MODULE}.getReturnsAccrualAmount`, details: e.message });
+            log.error({ title: `${MODULE}.getReturnsAccrualAmount`, details: e.message || e });
             return 0;
         }
     };
@@ -472,7 +472,7 @@ WHERE rtd.isinactive = 'F'
             return locked;
 
         } catch (e) {
-            log.error({ title: `${MODULE}.getLockedAccrualAmount`, details: e.message });
+            log.error({ title: `${MODULE}.getLockedAccrualAmount`, details: e.message || e });
             return 0;
         }
     };
@@ -548,7 +548,7 @@ WHERE rtd.isinactive = 'F'
             return results;
 
         } catch (e) {
-            log.error({ title: `${MODULE}.getOpenInvoices`, details: e.message });
+            log.error({ title: `${MODULE}.getOpenInvoices`, details: e.message || e });
             return [];
         }
     };
@@ -585,7 +585,7 @@ WHERE rtd.isinactive = 'F'
             return { taxCodeId: '', taxRate: 0 };
 
         } catch (e) {
-            log.error({ title: `${MODULE}.getTaxInfoFromInvoiceLine`, details: e.message });
+            log.error({ title: `${MODULE}.getTaxInfoFromInvoiceLine`, details: e.message || e });
             return { taxCodeId: '', taxRate: 0 };
         }
     };
@@ -617,7 +617,7 @@ WHERE rtd.isinactive = 'F'
             return results.length > 0 ? results[0] : null;
 
         } catch (e) {
-            log.error({ title: `${MODULE}.getAgreement`, details: e.message });
+            log.error({ title: `${MODULE}.getAgreement`, details: e.message || e });
             return null;
         }
     };
@@ -684,7 +684,7 @@ WHERE rtd.isinactive = 'F'
             return results;
 
         } catch (e) {
-            log.error({ title: `${MODULE}.getPendingWorkRecords`, details: e.message });
+            log.error({ title: `${MODULE}.getPendingWorkRecords`, details: e.message || e });
             return [];
         }
     };

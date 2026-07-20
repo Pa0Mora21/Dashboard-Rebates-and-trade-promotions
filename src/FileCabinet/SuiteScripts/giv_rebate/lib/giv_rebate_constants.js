@@ -133,9 +133,10 @@ define([], () => {
 
     // Valores nativos de NetSuite para custrecord_rm_settlement_method
     // en customrecord_rm_sales_transaction (Rebate Agreement)
+    // Verificado vía MCP el 2026-07-20: solo existen 2 métodos en esta cuenta.
     const SETTLEMENT_METHOD = {
-        CREDIT_MEMO:  3,   // Nota de Crédito (Credit Memo / Credit Note)
-        VENDOR_BILL:  1    // Factura de proveedor (Vendor Bill / Vendor Invoice)
+        CREDIT_MEMO:  3,   // Nota de Crédito (Credit Memo / Credit Note)  → refName: "Credit Memo"
+        VENDOR_BILL:  4    // Factura de proveedor (Bill / Vendor Bill)     → refName: "Bill"
     };
 
     return {

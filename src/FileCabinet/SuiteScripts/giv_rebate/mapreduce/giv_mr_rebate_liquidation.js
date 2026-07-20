@@ -107,17 +107,17 @@ define([
         } catch (e) {
             log.error({
                 title: `${MODULE}.map`,
-                details: `Context key: ${context.key}. Error: ${e.message}`
+                details: `[Key=${context.key}] ${e.message || e}`
             });
 
             try {
                 const searchResult = JSON.parse(context.value);
                 txnBuilder.updateWorkRecord(searchResult.id, {
                     status: 'Error',
-                    errorMessage: `Error en map: ${e.message}`
+                    errorMessage: `Error en map: ${e.message || e}`
                 });
             } catch (ue) {
-                log.error({ title: `${MODULE}.map.updateError`, details: ue.message });
+                log.error({ title: `${MODULE}.map.updateError`, details: `[WorkId=${searchResult.id}] ${ue.message || ue}` });
             }
         }
     };
@@ -159,9 +159,9 @@ define([
             const firstSourceRecord = workRecords.find(wr => wr.sourceInvoiceId) || null;
             if (firstSourceRecord) {
                 try {
-                    const invFields = record.lookupFields({
-                        type: record.Type.INVOICE,
-                        id:   firstSourceRecord.sourceInvoiceId,
+                    const invFields = search.lookupFields({
+                        type:    search.Type.INVOICE,
+                        id:      firstSourceRecord.sourceInvoiceId,
                         columns: ['location']
                     });
                     locationId = invFields.location?.[0]?.value || '';
@@ -184,7 +184,7 @@ define([
             let transactionType = '';
 
             // ── Procesar según método de liquidación ──
-            // Credit Memo = '3' | Vendor Bill = '1'  (constante SETTLEMENT_METHOD)
+            // Credit Memo = '3' | Bill (Vendor Bill) = '4'  (ver SETTLEMENT_METHOD en giv_rebate_constants.js)
             if (settlementMethod === '3') {
                 // ── CREDIT MEMO ──
                 let cmLines = [];
@@ -295,10 +295,17 @@ define([
                     description: `Liquidación rebate - Acuerdo ${agreementId}`
                 }));
 
+                const today      = new Date();
+                const startDate  = today;   // fecha de la transacción (igual al VB nativo)
+                const endDate    = today;   // fecha de cierre
+
                 generatedTxnId = txnBuilder.createVendorBill({
-                    vendorId:  agreement.payer_id,
-                    lines:     vbLines,
-                    location:  locationId
+                    vendorId:    agreement.payer_id,
+                    lines:       vbLines,
+                    location:    locationId,
+                    agreementId: agreementId,
+                    startDate:   startDate,
+                    endDate:     endDate
                 });
                 transactionType = 'Vendor Bill';
             }
@@ -354,7 +361,7 @@ define([
         } catch (e) {
             log.error({
                 title: `${MODULE}.reduce`,
-                details: `Group ${context.key}. Error: ${e.message}`
+                details: `[Group=${context.key}] ${e.message || e}`
             });
 
             workIds.forEach(id => {
@@ -364,7 +371,7 @@ define([
                         errorMessage: e.message
                     });
                 } catch (ue) {
-                    log.error({ title: `${MODULE}.reduce.updateError`, details: `WorkId: ${id}. ${ue.message}` });
+                    log.error({ title: `${MODULE}.reduce.updateError`, details: `[WorkId=${id}] ${ue.message || ue}` });
                 }
             });
         }

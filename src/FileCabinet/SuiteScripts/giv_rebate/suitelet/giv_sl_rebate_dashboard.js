@@ -282,7 +282,7 @@ define([
             context.response.writePage(form);
 
         } catch (e) {
-            log.error({ title: `${MODULE}.renderDashboard`, details: e.message });
+            log.error({ title: `${MODULE}.renderDashboard`, details: e.message || e });
             throw e;
         }
     };
@@ -363,7 +363,7 @@ define([
                 } catch (lineError) {
                     log.error({
                         title: `${MODULE}.populateSourceSublist.line`,
-                        details: `Line ${index} error: ${lineError.message}. Accrual: ${JSON.stringify(accrual)}`
+                        details: `[Line=${index}] ${lineError.message || lineError}. Accrual: ${JSON.stringify(accrual)}`
                     });
                 }
             });
@@ -371,7 +371,7 @@ define([
             log.debug({ title: `${MODULE}.populateSourceSublist`, details: `Populated ${accruals.length} source lines` });
 
         } catch (e) {
-            log.error({ title: `${MODULE}.populateSourceSublist`, details: e.message });
+            log.error({ title: `${MODULE}.populateSourceSublist`, details: e.message || e });
         }
     };
 
@@ -423,7 +423,7 @@ define([
             log.debug({ title: `${MODULE}.populateDestSublist`, details: `Populated ${invoices.length} destination lines` });
 
         } catch (e) {
-            log.error({ title: `${MODULE}.populateDestSublist`, details: e.message });
+            log.error({ title: `${MODULE}.populateDestSublist`, details: e.message || e });
         }
     };
 
@@ -644,7 +644,7 @@ define([
             });
 
         } catch (e) {
-            log.error({ title: `${MODULE}.processSubmission`, details: e.message });
+            log.error({ title: `${MODULE}.processSubmission`, details: e.message || e });
             renderErrorPage(context, [e.message]);
         }
     };

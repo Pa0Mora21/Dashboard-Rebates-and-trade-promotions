@@ -17,7 +17,7 @@ define(['N/log', './giv_rebate_dao'], (log, dao) => {
         } catch (e) {
             log.error({
                 title: `${MODULE}.getTaxScheduleFromSourceInvoice`,
-                details: `InvoiceId: ${invoiceId}, ItemId: ${itemId}. Error: ${e.message}`
+                details: `[InvoiceId=${invoiceId}, ItemId=${itemId}] ${e.message || e}`
             });
             return { taxScheduleId: '', taxScheduleText: '', taxRate: 0, lineAmount: 0 };
         }
@@ -64,7 +64,7 @@ define(['N/log', './giv_rebate_dao'], (log, dao) => {
         } catch (e) {
             log.error({
                 title: `${MODULE}.buildTaxDetailsOverride`,
-                details: `Error building tax details: ${e.message}`
+                details: `[workRecords=${workRecords.length}] ${e.message || e}`
             });
             throw e;
         }
@@ -92,7 +92,7 @@ define(['N/log', './giv_rebate_dao'], (log, dao) => {
         } catch (e) {
             log.error({
                 title: `${MODULE}.calculateTaxBasis`,
-                details: `Error: ${e.message}`
+                details: `${e.message || e}`
             });
             return {};
         }
@@ -124,7 +124,7 @@ define(['N/log', './giv_rebate_dao'], (log, dao) => {
         } catch (e) {
             log.error({
                 title: `${MODULE}.enrichWithTaxInfo`,
-                details: `Error enriching tax info: ${e.message}`
+                details: `[workRecords=${workRecords.length}] ${e.message || e}`
             });
             return workRecords;
         }

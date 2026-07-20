@@ -75,7 +75,7 @@ define(['N/log', './giv_rebate_dao'], (log, dao) => {
         } catch (e) {
             log.error({
                 title:   `${MODULE}.validateAvailableAmount`,
-                details: `AccrualId: ${accrualId}, ItemId: ${itemId}, Requested: ${requestedAmount}, Available: ${availableAmount}. Error: ${e.message}`
+                details: `[AccrualId=${accrualId}, ItemId=${itemId}, Requested=${requestedAmount}, Available=${availableAmount}] ${e.message || e}`
             });
             return {
                 valid: false,

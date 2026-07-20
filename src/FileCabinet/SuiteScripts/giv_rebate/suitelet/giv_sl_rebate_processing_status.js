@@ -180,7 +180,7 @@ define([
             context.response.writePage(form);
 
         } catch (e) {
-            log.error({ title: `${MODULE}.onRequest`, details: e.message });
+            log.error({ title: `${MODULE}.onRequest`, details: e.message || e });
             throw e;
         }
     };
@@ -216,7 +216,7 @@ define([
                 return true;
             });
         } catch (e) {
-            log.error({ title: `${MODULE}.getStatusCounters`, details: e.message });
+            log.error({ title: `${MODULE}.getStatusCounters`, details: e.message || e });
         }
         return counters;
     };
@@ -283,7 +283,7 @@ define([
             });
 
         } catch (e) {
-            log.error({ title: `${MODULE}.populateWorkSublist`, details: e.message });
+            log.error({ title: `${MODULE}.populateWorkSublist`, details: e.message || e });
         }
     };
 

@@ -126,7 +126,7 @@ define(['N/url', 'N/currentRecord'], (url, currentRecord) => {
             );
 
         } catch (e) {
-            console.error(`${MODULE}.suggestScenario: ${e.message}`);
+            console.error(`[suggestScenario] ${e.message}`);
         }
     };
 
@@ -259,7 +259,7 @@ define(['N/url', 'N/currentRecord'], (url, currentRecord) => {
             suggestScenario(rec);
 
         } catch (e) {
-            console.error(`${MODULE}.recalcTotals: ${e.message}`);
+            console.error(`[recalcTotals] ${e.message}`);
         }
     };
 
@@ -312,7 +312,7 @@ define(['N/url', 'N/currentRecord'], (url, currentRecord) => {
             }
 
         } catch (e) {
-            console.error(`${MODULE}.redistributeStandardDest: ${e.message}`);
+            console.error(`[redistributeStandardDest] ${e.message}`);
         }
     };
 
@@ -416,7 +416,7 @@ define(['N/url', 'N/currentRecord'], (url, currentRecord) => {
 
             recalcTotals(rec);
         } catch (e) {
-            console.error(`${MODULE}.selectAllProvisions: ${e.message}`);
+            console.error(`[selectAllProvisions] ${e.message}`);
             alert(e.message);
         }
     };
@@ -439,7 +439,7 @@ define(['N/url', 'N/currentRecord'], (url, currentRecord) => {
 
             recalcTotals(rec);
         } catch (e) {
-            console.error(`${MODULE}.deselectAllProvisions: ${e.message}`);
+            console.error(`[deselectAllProvisions] ${e.message}`);
             alert(e.message);
         }
     };
@@ -506,7 +506,7 @@ define(['N/url', 'N/currentRecord'], (url, currentRecord) => {
             window.location.href = suiteletUrl;
 
         } catch (e) {
-            console.error(`${MODULE}.searchAccruals: ${e.message}`);
+            console.error(`[searchAccruals] ${e.message}`);
             alert(e.message);
         }
     };

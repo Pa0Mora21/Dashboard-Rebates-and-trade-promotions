@@ -127,7 +127,7 @@ define(['N/record', 'N/log', 'N/runtime'], (record, log, runtime) => {
         } catch (e) {
             log.error({
                 title: `${MODULE}.createCreditMemo`,
-                details: `Customer: ${params.customerId}, Scenario: ${params.scenario}. Error: ${e.message}`
+                details: `[Customer=${params.customerId}, Scenario=${params.scenario}] ${e.message || e}`
             });
             throw e;
         }
@@ -140,7 +140,8 @@ define(['N/record', 'N/log', 'N/runtime'], (record, log, runtime) => {
      */
     const createVendorBill = (params) => {
         try {
-            const { vendorId, lines, currency, location } = params;
+            const { vendorId, lines, currency, location,
+                    agreementId, startDate, endDate } = params;
 
             if (!vendorId) {
                 throw new Error('El acuerdo de reembolso no tiene configurada la entidad pagadora (custrecord_hidden_payer).');
@@ -150,17 +151,61 @@ define(['N/record', 'N/log', 'N/runtime'], (record, log, runtime) => {
                 type: record.Type.VENDOR_BILL,
                 isDynamic: true,
                 defaultValues: {
-                    entity: vendorId
+                    entity:     vendorId,
+                    customform: 592   // Form "Rebates" — verificado en VB nativo 10793
                 }
             });
 
             if (currency) vbRec.setValue({ fieldId: 'currency', value: currency });
             if (location) vbRec.setValue({ fieldId: 'location', value: location });
 
+            // ── Campos de cabecera para paridad con el VB nativo ──────────────
+            // Verificado el 2026-07-20: el VB nativo (ID 10793) los contiene.
+            // Los valores se loggean para poder diagnosticar si el RM SuiteApp los sobreescribe.
+            if (agreementId) {
+                const agId = parseInt(agreementId, 10);
+                vbRec.setValue({ fieldId: 'custbody_rm_tran_bf_rebate_agr', value: agId });
+                log.debug({
+                    title: `${MODULE}.createVendorBill`,
+                    details: `Set custbody_rm_tran_bf_rebate_agr = ${agId} → readback = ${vbRec.getValue({ fieldId: 'custbody_rm_tran_bf_rebate_agr' })}`
+                });
+            }
+            if (startDate) {
+                const sd = startDate instanceof Date
+                    ? startDate.toISOString().slice(0, 10)   // 'YYYY-MM-DD'
+                    : String(startDate);
+                vbRec.setValue({ fieldId: 'custbody_rm_tran_startdate', value: new Date(sd) });
+                log.debug({
+                    title: `${MODULE}.createVendorBill`,
+                    details: `Set custbody_rm_tran_startdate = ${sd} → readback = ${vbRec.getValue({ fieldId: 'custbody_rm_tran_startdate' })}`
+                });
+            }
+            if (endDate) {
+                const ed = endDate instanceof Date
+                    ? endDate.toISOString().slice(0, 10)
+                    : String(endDate);
+                vbRec.setValue({ fieldId: 'custbody_rm_tran_enddate', value: new Date(ed) });
+                log.debug({
+                    title: `${MODULE}.createVendorBill`,
+                    details: `Set custbody_rm_tran_enddate = ${ed} → readback = ${vbRec.getValue({ fieldId: 'custbody_rm_tran_enddate' })}`
+                });
+            }
+            // Marcar como recibida y aprobada automáticamente (el nativo tiene approvalstatus=2)
+            vbRec.setValue({ fieldId: 'approvalstatus', value: 2 });  // 2 = Approved
+            vbRec.setValue({ fieldId: 'received',        value: true });
+
+            // ── Líneas de artículo ────────────────────────────────────────────
+            // FIX: en modo dinámico, setear 'amount' directamente hace que NS
+            // recalcule quantity = amount / item_rate (tasa del catálogo = 2.40)
+            // resultando en un monto final distinto al solicitado.
+            // Solución: fijar quantity=1 y rate=monto deseado → amount = 1×rate = correcto.
             lines.forEach((line) => {
+                const targetAmount = Math.round(parseFloat(line.amount) * 100) / 100;
+
                 vbRec.selectNewLine({ sublistId: 'item' });
-                vbRec.setCurrentSublistValue({ sublistId: 'item', fieldId: 'item', value: line.itemId });
-                vbRec.setCurrentSublistValue({ sublistId: 'item', fieldId: 'amount', value: Math.round(parseFloat(line.amount) * 100) / 100 });
+                vbRec.setCurrentSublistValue({ sublistId: 'item', fieldId: 'item',     value: line.itemId });
+                vbRec.setCurrentSublistValue({ sublistId: 'item', fieldId: 'quantity', value: 1 });
+                vbRec.setCurrentSublistValue({ sublistId: 'item', fieldId: 'rate',     value: targetAmount });
 
                 if (line.taxCodeId) {
                     vbRec.setCurrentSublistValue({ sublistId: 'item', fieldId: 'taxcode', value: line.taxCodeId });
@@ -171,7 +216,7 @@ define(['N/record', 'N/log', 'N/runtime'], (record, log, runtime) => {
                 vbRec.commitLine({ sublistId: 'item' });
             });
 
-            const vendorBillId = vbRec.save({ enableSourcing: true, ignoreMandatoryFields: false });
+            const vendorBillId = vbRec.save({ enableSourcing: true, ignoreMandatoryFields: true });
 
             log.audit({
                 title: `${MODULE}.createVendorBill`,
@@ -183,7 +228,7 @@ define(['N/record', 'N/log', 'N/runtime'], (record, log, runtime) => {
         } catch (e) {
             log.error({
                 title: `${MODULE}.createVendorBill`,
-                details: `VendorId: ${params.vendorId}. Error: ${e.message}`
+                details: `[VendorId=${params.vendorId}] ${e.message || e}`
             });
             throw e;
         }
@@ -259,7 +304,7 @@ define(['N/record', 'N/log', 'N/runtime'], (record, log, runtime) => {
         } catch (e) {
             log.error({
                 title: `${MODULE}.createWorkRecord`,
-                details: `Agreement: ${data.agreementId}. Error: ${e.message}`
+                details: `[Agreement=${data.agreementId}] ${e.message || e}`
             });
             throw e;
         }
@@ -336,7 +381,7 @@ define(['N/record', 'N/log', 'N/runtime'], (record, log, runtime) => {
         } catch (e) {
             log.error({
                 title: `${MODULE}.createHistoryRecord`,
-                details: `Agreement: ${data.agreementId}. Error: ${e.message}`
+                details: `[Agreement=${data.agreementId}] ${e.message || e}`
             });
             throw e;
         }
@@ -369,7 +414,7 @@ define(['N/record', 'N/log', 'N/runtime'], (record, log, runtime) => {
         } catch (e) {
             log.error({
                 title:   `${MODULE}.updateWorkRecord`,
-                details: `WorkId: ${workId}. Error: ${e.message}`
+                details: `[WorkId=${workId}] ${e.message || e}`
             });
             throw e;
         }
