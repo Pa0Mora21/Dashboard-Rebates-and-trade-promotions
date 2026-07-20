@@ -29,13 +29,26 @@ define([
      * getInputData — Busca registros WORK con estado "Capturado".
      */
     const getInputData = () => {
-        log.audit({ title: `${MODULE}.getInputData`, details: 'Starting liquidation M/R' });
+        // FIX 5: leer el parámetro de lote CSV (si el M/R fue disparado desde giv_sl_rebate_csv_upload).
+        // Si está presente, filtrar solo los WORK de ese lote para evitar mezclar
+        // WORKs manuales concurrentes con WORKs de CSV en el mismo ciclo.
+        const csvBatchId = runtime.getCurrentScript().getParameter({ name: 'custscript_giv_mr_csv_batch_id' }) || '';
+
+        log.audit({
+            title:   `${MODULE}.getInputData`,
+            details: `Starting liquidation M/R${csvBatchId ? ` | CSV Batch: ${csvBatchId}` : ' | Suitelet manual (todos los Capturado)'}`
+        });
+
+        const filters = [['custrecord_giv_lw_proc_status', 'is', 'Capturado']];
+
+        if (csvBatchId) {
+            // Solo procesar el lote CSV específico
+            filters.push('AND', ['custrecord_giv_lw_csv_batch_id', 'is', csvBatchId]);
+        }
 
         return search.create({
             type: 'customrecord_giv_rebate_liq_work',
-            filters: [
-                ['custrecord_giv_lw_proc_status', 'is', 'Capturado']
-            ],
+            filters: filters,
             columns: [
                 search.createColumn({ name: 'internalid' }),
                 search.createColumn({ name: 'custrecord_giv_lw_customer' }),
@@ -354,7 +367,7 @@ define([
             });
 
             log.audit({
-                title: `${MODULE}.reduce`,
+                title:   `${MODULE}.reduce`,
                 details: `Group ${context.key}: Generated ${transactionType} ${generatedTxnId} for ${workRecords.length} WORK records`
             });
 

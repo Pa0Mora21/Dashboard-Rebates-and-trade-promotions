@@ -7,10 +7,10 @@
  *              dentro de un rango de fechas para forzar el recálculo nativo de Accruals
  *              cuando las condiciones del acuerdo han cambiado retroactivamente.
  *
- * Parámetros de Script:
- * - custscript_giv_reprocess_agreement: Internal ID del Rebate Agreement
- * - custscript_giv_reprocess_date_from: Fecha inicio
- * - custscript_giv_reprocess_date_to: Fecha fin
+ * Parámetros de Script (IDs reales del XML):
+ * - custscript_giv_reproc_agreement:  Internal ID del Rebate Agreement
+ * - custscript_giv_reproc_date_from:  Fecha inicio
+ * - custscript_giv_reproc_date_to:    Fecha fin
  */
 define([
     'N/search',
@@ -27,9 +27,9 @@ define([
      */
     const getInputData = () => {
         const script = runtime.getCurrentScript();
-        const agreementId = script.getParameter({ name: 'custscript_giv_reprocess_agreement' });
-        const dateFrom = script.getParameter({ name: 'custscript_giv_reprocess_date_from' });
-        const dateTo = script.getParameter({ name: 'custscript_giv_reprocess_date_to' });
+        const agreementId = script.getParameter({ name: 'custscript_giv_reproc_agreement' });
+        const dateFrom    = script.getParameter({ name: 'custscript_giv_reproc_date_from'  });
+        const dateTo      = script.getParameter({ name: 'custscript_giv_reproc_date_to'    });
 
         log.audit({
             title: `${MODULE}.getInputData`,

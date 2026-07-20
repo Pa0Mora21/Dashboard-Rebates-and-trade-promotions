@@ -12,10 +12,11 @@ define([
     'N/task',
     'N/redirect',
     'N/log',
+    'N/runtime',                              // FIX 1: runtime era necesario para batchId
     '../lib/giv_rebate_validator',
     '../lib/giv_rebate_transaction_builder',
     '../lib/giv_rebate_dao'
-], (serverWidget, file, task, redirect, log, validator, txnBuilder, dao) => {
+], (serverWidget, file, task, redirect, log, runtime, validator, txnBuilder, dao) => {
 
     const MODULE = 'giv_sl_rebate_csv_upload';
 
@@ -155,27 +156,112 @@ define([
                         continue;
                     }
 
-                    // Obtener información fiscal
+                    // ── FIX 2+3: Resolver el Accrual real antes de crear el WORK ──────────────
+                    // El CSV no lleva accrualId; se busca por Factura+Artículo+Acuerdo.
+                    const accruals = dao.getAvailableAccruals({
+                        agreementId:      rowData.agreementId,
+                        sourceInvoiceIds: [rowData.sourceInvoiceId],
+                        itemId:           rowData.itemId
+                    });
+
+                    if (!accruals || accruals.length === 0) {
+                        const noAccrualMsg = `Fila ${i + 1}: No se encontró provisión disponible para ` +
+                            `Factura ${rowData.sourceInvoiceId} / Artículo ${rowData.itemId} ` +
+                            `en el acuerdo ${rowData.agreementId}.`;
+                        errors.push(noAccrualMsg);
+                        errorCount++;
+
+                        // Crear WORK de error para trazabilidad del lote
+                        try {
+                            const errorWorkId = txnBuilder.createWorkRecord({
+                                customerId:       rowData.customerId,
+                                agreementId:      rowData.agreementId,
+                                settlementMethod: settlementMethod,
+                                scenario:         rowData.scenario,
+                                sourceInvoiceId:  rowData.sourceInvoiceId,
+                                sourceAccrualId:  '0',
+                                sourceItemId:     rowData.itemId,
+                                originalAmount:   0,
+                                availableAmount:  0,
+                                amountToSettle:   parseFloat(rowData.amountToSettle) || 0,
+                                csvBatchId:       batchId
+                            }, 'CSV');
+                            txnBuilder.updateWorkRecord(errorWorkId, {
+                                status:       'Error',
+                                errorMessage: noAccrualMsg
+                            });
+                        } catch (wErr) {
+                            log.error({ title: `${MODULE}.processUpload`, details: `[Fila=${i+1}] Error creando WORK de error (sin accrual): ${wErr.message || wErr}` });
+                        }
+                        continue;
+                    }
+
+                    const accrual         = accruals[0];
+                    const sourceAccrualId = accrual.accrualId;
+                    const originalAmount  = accrual.accrualAmount;
+                    const availableAmount = accrual.availableAmount;
+
+                    // ── FIX 6: Validar disponibilidad real (excepto Cobro en exceso) ────────────
+                    // DRD: "el script debe validar contra la base de datos en tiempo real
+                    //        que el saldo sigue disponible".
+                    if (rowData.scenario !== 'Cobro en exceso') {
+                        const availCheck = validator.validateAvailableAmount(
+                            sourceAccrualId,
+                            rowData.itemId,
+                            parseFloat(rowData.amountToSettle) || 0,
+                            rowData.scenario,
+                            availableAmount
+                        );
+                        if (!availCheck.valid) {
+                            errors.push(`Fila ${i + 1}: ${availCheck.message}`);
+                            errorCount++;
+
+                            try {
+                                const errorWorkId = txnBuilder.createWorkRecord({
+                                    customerId:       rowData.customerId,
+                                    agreementId:      rowData.agreementId,
+                                    settlementMethod: settlementMethod,
+                                    scenario:         rowData.scenario,
+                                    sourceInvoiceId:  rowData.sourceInvoiceId,
+                                    sourceAccrualId:  sourceAccrualId,
+                                    sourceItemId:     rowData.itemId,
+                                    originalAmount:   originalAmount,
+                                    availableAmount:  availableAmount,
+                                    amountToSettle:   parseFloat(rowData.amountToSettle) || 0,
+                                    csvBatchId:       batchId
+                                }, 'CSV');
+                                txnBuilder.updateWorkRecord(errorWorkId, {
+                                    status:       'Error',
+                                    errorMessage: availCheck.message
+                                });
+                            } catch (wErr) {
+                                log.error({ title: `${MODULE}.processUpload`, details: `[Fila=${i+1}] Error creando WORK de error (disponibilidad): ${wErr.message || wErr}` });
+                            }
+                            continue;
+                        }
+                    }
+
+                    // ── FIX 4: getTaxInfoFromInvoiceLine devuelve taxCodeId, no taxScheduleId ─
                     const taxInfo = dao.getTaxInfoFromInvoiceLine(rowData.sourceInvoiceId, rowData.itemId);
 
-                    // Crear registro WORK
+                    // Crear registro WORK con todos los campos correctamente resueltos
                     const workData = {
-                        customerId: rowData.customerId,
-                        agreementId: rowData.agreementId,
+                        customerId:       rowData.customerId,
+                        agreementId:      rowData.agreementId,
                         settlementMethod: settlementMethod,
-                        scenario: rowData.scenario,
-                        sourceInvoiceId: rowData.sourceInvoiceId,
-                        sourceAccrualId: '0', // Se resolverá en el Map/Reduce
-                        sourceItemId: rowData.itemId,
-                        originalAmount: 0,
-                        availableAmount: 0,
-                        amountToSettle: rowData.amountToSettle,
-                        invoiceTo: rowData.invoiceTo,
-                        applyAmount: rowData.applyAmount,
-                        taxScheduleId: taxInfo.taxScheduleId,
-                        taxBasis: rowData.amountToSettle,
-                        excessFlag: rowData.scenario === 'Cobro en exceso',
-                        csvBatchId: batchId
+                        scenario:         rowData.scenario,
+                        sourceInvoiceId:  rowData.sourceInvoiceId,
+                        sourceAccrualId:  sourceAccrualId,     // FIX 2: ID real del Accrual
+                        sourceItemId:     rowData.itemId,
+                        originalAmount:   originalAmount,      // FIX 3: monto provisionado real
+                        availableAmount:  availableAmount,     // FIX 3: saldo disponible real
+                        amountToSettle:   rowData.amountToSettle,
+                        invoiceTo:        rowData.invoiceTo,
+                        applyAmount:      rowData.applyAmount,
+                        taxCodeId:        taxInfo.taxCodeId,   // FIX 4: propiedad correcta
+                        taxBasis:         rowData.amountToSettle,
+                        excessFlag:       rowData.scenario === 'Cobro en exceso',
+                        csvBatchId:       batchId
                     };
 
                     txnBuilder.createWorkRecord(workData, 'CSV');
@@ -190,10 +276,15 @@ define([
             // Disparar Map/Reduce si hay registros exitosos
             let mrTaskId = '';
             if (successCount > 0) {
+                // FIX 5: pasar batchId como parámetro de script para que el M/R
+                // pueda aislar este lote CSV de posibles WORKs manuales concurrentes.
                 const mrTask = task.create({
-                    taskType: task.TaskType.MAP_REDUCE,
-                    scriptId: '_giv_mr_rebate_liquidation',
-                    deploymentId: '_giv_dep_mr_liquidation'
+                    taskType:     task.TaskType.MAP_REDUCE,
+                    scriptId:     'customscript_giv_mr_liquidation',    // ID real del XML
+                    deploymentId: 'customdeploy_giv_mr_liquidation',    // ID real del XML
+                    params: {
+                        custscript_giv_mr_csv_batch_id: batchId
+                    }
                 });
                 mrTaskId = mrTask.submit();
             }
@@ -206,8 +297,8 @@ define([
             // Redirect a pantalla de estado
             if (successCount > 0) {
                 redirect.toSuitelet({
-                    scriptId: '_giv_sl_rebate_status',
-                    deploymentId: '_giv_dep_rebate_status',
+                    scriptId:     'customscript_giv_sl_rebate_status',   // ID real del XML
+                    deploymentId: 'customdeploy_giv_sl_status',           // ID real del XML
                     parameters: {
                         custpage_mr_task_id: mrTaskId,
                         custpage_batch_id: batchId,

@@ -10,6 +10,13 @@
       <ismandatory>F</ismandatory>
       <displaytype>NORMAL</displaytype>
     </scriptcustomfield>
+    <scriptcustomfield scriptid="custscript_giv_mr_csv_batch_id">
+      <label>CSV Batch ID</label>
+      <fieldtype>TEXT</fieldtype>
+      <ismandatory>F</ismandatory>
+      <displaytype>NORMAL</displaytype>
+      <help>Identificador del lote CSV que dispara este Map/Reduce. Cuando est&#225; presente, el script procesa &#250;nicamente los WORK records de ese lote. Vac&#237;o = procesa todos los Capturado (modo manual desde Suitelet).</help>
+    </scriptcustomfield>
   </scriptcustomfields>
   <scriptdeployments>
     <scriptdeployment scriptid="customdeploy_giv_mr_liquidation">

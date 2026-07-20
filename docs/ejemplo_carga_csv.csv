@@ -1,0 +1,5 @@
+External ID,Cliente (Internal ID),Agreement (Internal ID),Tipo de liquidación,Factura Origen (Internal ID),Artículo (Internal ID),Monto a Liquidar,Factura Destino (Internal ID),Monto a Aplicar
+LIQ-2026-001,141,1,Estándar,10455,311,7.00,10773,7.00
+LIQ-2026-002,141,4,Consolidada,10455,647,29.64,9638,29.64
+LIQ-2026-002,141,3,Consolidada,10455,647,86.56,9638,86.56
+LIQ-2026-003,141,9,Estándar,10773,311,0.15,,

@@ -79,13 +79,13 @@ define([
             const dateTo = context.request.parameters.custpage_date_to;
 
             const mrTask = task.create({
-                taskType: task.TaskType.MAP_REDUCE,
-                scriptId: '_giv_mr_rebate_reprocess',
-                deploymentId: '_giv_dep_mr_reprocess',
+                taskType:     task.TaskType.MAP_REDUCE,
+                scriptId:     'customscript_giv_mr_reprocess',      // ID real del XML
+                deploymentId: 'customdeploy_giv_mr_reprocess',      // ID real del XML
                 params: {
-                    custscript_giv_reprocess_agreement: agreementId,
-                    custscript_giv_reprocess_date_from: dateFrom,
-                    custscript_giv_reprocess_date_to: dateTo
+                    custscript_giv_reproc_agreement:  agreementId,  // ID real del XML
+                    custscript_giv_reproc_date_from:  dateFrom,     // ID real del XML
+                    custscript_giv_reproc_date_to:    dateTo        // ID real del XML
                 }
             });
 

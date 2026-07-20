@@ -242,13 +242,18 @@ define(['N/record', 'N/log', 'N/runtime'], (record, log, runtime) => {
         try {
             const workRec = record.create({ type: 'customrecord_giv_rebate_liq_work', isDynamic: true });
 
+            // NOTA: custrecord_giv_rebate_liq_work tiene <includename>F</includename>
+            // NetSuite auto-genera el campo 'name' con el Internal ID — no se debe setear.
+
             workRec.setValue({ fieldId: 'custrecord_giv_lw_customer', value: data.customerId });
             workRec.setValue({ fieldId: 'custrecord_giv_lw_agreement', value: data.agreementId });
-            workRec.setValue({ fieldId: 'custrecord_giv_lw_settle_method', value: data.settlementMethod });
+            workRec.setValue({ fieldId: 'custrecord_giv_lw_settle_method', value: String(data.settlementMethod || '') });
             workRec.setValue({ fieldId: 'custrecord_giv_lw_scenario', value: data.scenario });
-            if (data.sourceAccrualId) {
-                workRec.setValue({ fieldId: 'custrecord_giv_lw_source_accrual', value: data.sourceAccrualId });
-            }
+
+            // custrecord_giv_lw_source_accrual es MANDATORY (ismandatory=T).
+            // Se debe setear siempre, incluso cuando es '0' (sin accrual resuelto = error de trazabilidad).
+            // El if anterior con truthiness check lo omitía cuando era '0', causando "Field must contain a value".
+            workRec.setValue({ fieldId: 'custrecord_giv_lw_source_accrual', value: parseInt(data.sourceAccrualId, 10) || 0 });
 
             workRec.setValue({ fieldId: 'custrecord_giv_lw_original_amt', value: parseFloat(data.originalAmount) || 0 });
             workRec.setValue({ fieldId: 'custrecord_giv_lw_available_amt', value: parseFloat(data.availableAmount) || 0 });
@@ -256,13 +261,10 @@ define(['N/record', 'N/log', 'N/runtime'], (record, log, runtime) => {
             workRec.setValue({ fieldId: 'custrecord_giv_lw_proc_status', value: 'Capturado' });
             workRec.setValue({ fieldId: 'custrecord_giv_lw_created_from', value: createdFrom });
 
-            // Campos opcionales
-            if (data.sourceInvoiceId) {
-                workRec.setValue({ fieldId: 'custrecord_giv_lw_source_invoice', value: data.sourceInvoiceId });
-            }
-            if (data.sourceItemId) {
-                workRec.setValue({ fieldId: 'custrecord_giv_lw_source_item', value: data.sourceItemId });
-            }
+            // Campos MANDATORY según XML (ismandatory=T): siempre se setean aunque sean 0/vacío.
+            // Un if-check con truthiness los omitía cuando eran falsy, causando "Field must contain a value".
+            workRec.setValue({ fieldId: 'custrecord_giv_lw_source_invoice', value: parseInt(data.sourceInvoiceId, 10) || 0 });
+            workRec.setValue({ fieldId: 'custrecord_giv_lw_source_item',    value: parseInt(data.sourceItemId, 10) || 0 });
             if (data.returnsAmount) {
                 workRec.setValue({ fieldId: 'custrecord_giv_lw_returns_amt', value: parseFloat(data.returnsAmount) || 0 });
             }

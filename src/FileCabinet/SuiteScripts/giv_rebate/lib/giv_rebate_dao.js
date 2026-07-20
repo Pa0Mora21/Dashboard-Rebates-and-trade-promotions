@@ -614,7 +614,32 @@ WHERE rtd.isinactive = 'F'
             `;
 
             const results = query.runSuiteQL({ query: sql, params: [agreementId] }).asMappedResults();
-            return results.length > 0 ? results[0] : null;
+            if (results.length === 0) return null;
+
+            // Retorna AMBOS formatos para compatibilidad con todos los callers:
+            //   - camelCase: nuevo estándar (giv_sl_rebate_csv_upload.js usa settlementMethod)
+            //   - snake_case: callers existentes (giv_sl_rebate_dashboard.js y giv_mr_rebate_liquidation.js
+            //                 usan settlement_method y accounting_item)
+            const r = results[0];
+            return {
+                // ── camelCase (estándar nuevo) ──
+                id:               String(r.id),
+                name:             r.name                 || '',
+                settlementMethod: String(r.settlement_method || ''),
+                payerId:          String(r.payer_id       || ''),
+                accountingItem:   String(r.accounting_item || ''),
+                subsidiaryId:     String(r.subsidiary_id  || ''),
+                status:           r.status               || '',
+                creditAccount:    String(r.credit_account || ''),
+                debitAccount:     String(r.debit_account  || ''),
+                // ── snake_case (backward-compat para Dashboard y M/R) ──
+                settlement_method: String(r.settlement_method || ''),
+                payer_id:          String(r.payer_id       || ''),
+                accounting_item:   String(r.accounting_item || ''),
+                subsidiary_id:     String(r.subsidiary_id  || ''),
+                credit_account:    String(r.credit_account || ''),
+                debit_account:     String(r.debit_account  || '')
+            };
 
         } catch (e) {
             log.error({ title: `${MODULE}.getAgreement`, details: e.message || e });
