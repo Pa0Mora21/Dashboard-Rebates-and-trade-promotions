@@ -39,7 +39,7 @@ define([
         if (!agreementId || !dateFrom || !dateTo) {
             log.error({
                 title: `${MODULE}.getInputData`,
-                details: 'Missing required parameters: agreement, dateFrom, or dateTo'
+                details: 'Faltan parámetros obligatorios: acuerdo, fecha desde o fecha hasta'
             });
             return [];
         }
@@ -85,7 +85,7 @@ define([
         } catch (e) {
             log.error({
                 title: `${MODULE}.map`,
-                details: `Key: ${context.key}. Error: ${e.message}`
+                details: `[Key=${context.key}] ${e.message || e}`
             });
         }
     };
@@ -129,7 +129,7 @@ define([
         } catch (e) {
             log.error({
                 title: `${MODULE}.reduce`,
-                details: `Invoice ${invoiceId}. Error: ${e.message}`
+                details: `[Invoice=${invoiceId}] ${e.message || e}`
             });
         }
     };

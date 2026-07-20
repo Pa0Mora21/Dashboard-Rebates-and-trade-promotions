@@ -118,7 +118,7 @@ define([
                         settlementMethod = agreementDetails.settlementMethod;
                         rowData.settlementMethod = settlementMethod;
                     } catch (agErr) {
-                        errors.push(`Fila ${i + 1}: No se pudo obtener el acuerdo ${rowData.agreementId}. ${agErr.message}`);
+                        errors.push(`Fila ${i + 1}: No se pudo obtener el acuerdo ${rowData.agreementId}. ${agErr.message || agErr}`);
                         errorCount++;
                         continue;
                     }
@@ -150,7 +150,7 @@ define([
                                 errorMessage: rowValidation.errors.join(' | ')
                             });
                         } catch (wErr) {
-                            log.error({ title: `${MODULE}.processUpload`, details: `Error creating error WORK record: ${wErr.message}` });
+                            log.error({ title: `${MODULE}.processUpload`, details: `[Fila=${i+1}] Error creando WORK de error: ${wErr.message || wErr}` });
                         }
                         continue;
                     }
@@ -182,7 +182,7 @@ define([
                     successCount++;
 
                 } catch (rowErr) {
-                    errors.push(`Fila ${i + 1}: Error inesperado — ${rowErr.message}`);
+                    errors.push(`Fila ${i + 1}: Error inesperado — ${rowErr.message || rowErr}`);
                     errorCount++;
                 }
             }
@@ -220,7 +220,7 @@ define([
             }
 
         } catch (e) {
-            log.error({ title: `${MODULE}.processUpload`, details: e.message });
+            log.error({ title: `${MODULE}.processUpload`, details: e.message || e });
             renderResultPage(context, 0, 0, [e.message]);
         }
     };

@@ -50,8 +50,8 @@
 
     <customrecordcustomfield scriptid="custrecord_giv_lh_src_accrual">
       <label>Source Rebate Accrual</label>
-      <fieldtype>SELECT</fieldtype>
-      <selectrecordtype>-30</selectrecordtype>
+      <fieldtype>INTEGER</fieldtype>
+      <!-- customrecord_rm_accruals pertenece a SuiteApp gestionada; se almacena el ID numérico directamente -->
       <ismandatory>F</ismandatory>
       <displaytype>NORMAL</displaytype>
     </customrecordcustomfield>

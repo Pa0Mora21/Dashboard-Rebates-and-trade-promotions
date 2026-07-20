@@ -2,6 +2,15 @@
   <name>GIV Rebate Liquidation MR</name>
   <notifyadmins>F</notifyadmins>
   <scriptfile>[/SuiteScripts/giv_rebate/mapreduce/giv_mr_rebate_liquidation.js]</scriptfile>
+  <scriptcustomfields>
+    <scriptcustomfield scriptid="custscript_giv_mr_default_location">
+      <label>Default Location</label>
+      <fieldtype>SELECT</fieldtype>
+      <selectrecordtype>-103</selectrecordtype>
+      <ismandatory>F</ismandatory>
+      <displaytype>NORMAL</displaytype>
+    </scriptcustomfield>
+  </scriptcustomfields>
   <scriptdeployments>
     <scriptdeployment scriptid="customdeploy_giv_mr_liquidation">
       <title>GIV Rebate Liquidation MR</title>

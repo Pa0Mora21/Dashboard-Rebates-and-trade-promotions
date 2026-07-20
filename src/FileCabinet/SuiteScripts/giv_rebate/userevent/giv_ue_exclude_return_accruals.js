@@ -43,7 +43,7 @@ define(['N/search', 'N/log'], (search, log) => {
             //log.audit({ title: `${MODULE}.isExcluded.field`, details: fields });
             return fields.custrecord_giv_exclude_returns === true;
         } catch (e) {
-            log.error({ title: `${MODULE}.isExcluded`, details: e });
+            log.error({ title: `${MODULE}.isExcluded`, details: e.message || e });
             return false;
         }
     };
@@ -152,7 +152,7 @@ define(['N/search', 'N/log'], (search, log) => {
 
 
         } catch (e) {
-            log.error({ title: `${MODULE}.beforeSubmit`, details: e });
+            log.error({ title: `${MODULE}.beforeSubmit`, details: e.message || e });
         }
     };
 

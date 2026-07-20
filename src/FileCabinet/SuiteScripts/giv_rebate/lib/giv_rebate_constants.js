@@ -30,9 +30,11 @@ define([], () => {
             SCENARIO_GROUPED:      'Agrupación',
 
             // Botones
-            BTN_SEARCH:  'Buscar Provisiones',
-            BTN_PROCESS: 'Procesar Liquidación',
-            BTN_BACK:    'Regresar al Dashboard',
+            BTN_SEARCH:       'Buscar Provisiones',
+            BTN_PROCESS:      'Procesar Liquidación',
+            BTN_BACK:         'Regresar al Dashboard',
+            BTN_SELECT_ALL:   'Seleccionar Todas',
+            BTN_DESELECT_ALL: 'Desmarcar Todas',
 
             // Sublista origen
             SRC_TITLE:     'Reembolsos Disponibles',
@@ -80,9 +82,11 @@ define([], () => {
             SCENARIO_EXCESS:       'Excess Collection',
             SCENARIO_GROUPED:      'Grouped',
 
-            BTN_SEARCH:  'Search Provisions',
-            BTN_PROCESS: 'Process Settlement',
-            BTN_BACK:    'Back to Dashboard',
+            BTN_SEARCH:       'Search Provisions',
+            BTN_PROCESS:      'Process Settlement',
+            BTN_BACK:         'Back to Dashboard',
+            BTN_SELECT_ALL:   'Select All',
+            BTN_DESELECT_ALL: 'Deselect All',
 
             SRC_TITLE:     'Available Rebates',
             SELECT:        'Select',
@@ -127,8 +131,17 @@ define([], () => {
         }
     };
 
+    // Valores nativos de NetSuite para custrecord_rm_settlement_method
+    // en customrecord_rm_sales_transaction (Rebate Agreement)
+    // Verificado vía MCP el 2026-07-20: solo existen 2 métodos en esta cuenta.
+    const SETTLEMENT_METHOD = {
+        CREDIT_MEMO:  3,   // Nota de Crédito (Credit Memo / Credit Note)  → refName: "Credit Memo"
+        VENDOR_BILL:  4    // Factura de proveedor (Bill / Vendor Bill)     → refName: "Bill"
+    };
+
     return {
         LABELS,
-        getLabels
+        getLabels,
+        SETTLEMENT_METHOD
     };
 });

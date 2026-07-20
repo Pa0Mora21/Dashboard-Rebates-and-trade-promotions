@@ -32,15 +32,36 @@ define(['N/log', './giv_rebate_dao'], (log, dao) => {
 
     /**
      * Valida en tiempo real que el saldo sigue disponible (prevención de concurrencia).
+     * También bloquea que el monto solicitado supere el saldo disponible en escenarios comunes.
+     *
+     * @param {string} accrualId       - Internal ID del Accrual
+     * @param {string} itemId          - Internal ID del artículo
+     * @param {number} requestedAmount - Monto que el usuario quiere liquidar
+     * @param {string} scenario        - Escenario seleccionado
+     * @param {number} availableAmount - Saldo disponible leido en el dashboard (valor de custpage_src_available)
      */
-    const validateAvailableAmount = (accrualId, itemId, requestedAmount, scenario) => {
+    const validateAvailableAmount = (accrualId, itemId, requestedAmount, scenario, availableAmount) => {
         try {
-            const locked = dao.getLockedAccrualAmounts(accrualId, itemId);
-
+            // ── Cobro en exceso: no aplica ninguna restricción de monto ──
             if (scenario === 'Cobro en exceso') {
                 return { valid: true, message: '', currentAvailable: 0 };
             }
 
+            // ── Bloqueo estricto: monto solicitado > saldo disponible ──
+            // DRD: solo el escenario "Cobro en exceso" puede superar el disponible.
+            // Para todos los demás, el monto es un límite duro.
+            const available = parseFloat(availableAmount) || 0;
+            if (requestedAmount > Math.round(available * 100) / 100 + 0.001) {  // +0.001 tolerancia de redondeo
+                return {
+                    valid: false,
+                    message: `El monto a liquidar ($${requestedAmount.toFixed(2)}) supera el saldo disponible ($${available.toFixed(2)}). ` +
+                             'Solo el escenario "Cobro en exceso" permite liquidar por encima del disponible.',
+                    currentAvailable: available
+                };
+            }
+
+            // ── Validación de concurrencia: si ya hay otro WORK bloqueando el saldo ──
+            const locked = dao.getLockedAccrualAmounts(accrualId, itemId);
             if (requestedAmount > 0 && locked > 0) {
                 return {
                     valid: false,
@@ -49,12 +70,12 @@ define(['N/log', './giv_rebate_dao'], (log, dao) => {
                 };
             }
 
-            return { valid: true, message: '', currentAvailable: 0 };
+            return { valid: true, message: '', currentAvailable: available };
 
         } catch (e) {
             log.error({
-                title: `${MODULE}.validateAvailableAmount`,
-                details: `AccrualId: ${accrualId}, ItemId: ${itemId}, Amount: ${requestedAmount}. Error: ${e.message}`
+                title:   `${MODULE}.validateAvailableAmount`,
+                details: `[AccrualId=${accrualId}, ItemId=${itemId}, Requested=${requestedAmount}, Available=${availableAmount}] ${e.message || e}`
             });
             return {
                 valid: false,
@@ -74,7 +95,8 @@ define(['N/log', './giv_rebate_dao'], (log, dao) => {
             errors.push('Debe seleccionar al menos una provisión para liquidar.');
         }
 
-        if (settlementMethod === '2') {
+        // settlementMethod '3' = Credit Memo (valor real en custrecord_rm_settlement_method)
+        if (settlementMethod === '3') {
             if ((!destLines || destLines.length === 0) && scenario !== 'Cobro en exceso') {
                 errors.push('Debe seleccionar al menos una factura destino para liquidaciones por Credit Memo.');
             }
@@ -136,7 +158,9 @@ define(['N/log', './giv_rebate_dao'], (log, dao) => {
             errors.push(`${prefix} Monto a liquidar debe ser mayor a cero.`);
         }
 
-        if (rowData.settlementMethod === '2') {
+        // Credit Memo = '3' (custrecord_rm_settlement_method interno en NetSuite)
+        // [FIX] Era '2', valor incorrecto — el ID real de Credit Memo es 3
+        if (rowData.settlementMethod === '3') {
             if (!rowData.invoiceTo) {
                 errors.push(`${prefix} Factura destino es obligatoria para liquidaciones por Credit Memo.`);
             }

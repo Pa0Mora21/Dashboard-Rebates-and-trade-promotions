@@ -117,7 +117,7 @@ define([
             context.response.writePage(form);
 
         } catch (e) {
-            log.error({ title: `${MODULE}.processReprocess`, details: e.message });
+            log.error({ title: `${MODULE}.processReprocess`, details: e.message || e });
 
             const form = serverWidget.createForm({ title: 'Error en Reprocesamiento' });
             const errorField = form.addField({
