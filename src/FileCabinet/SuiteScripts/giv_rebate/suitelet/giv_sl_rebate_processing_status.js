@@ -17,21 +17,30 @@ define([
 
     const MODULE = 'giv_sl_rebate_processing_status';
 
+    // Tipos de transacción por método de liquidación
+    const SETTLE_LABEL   = { '3': 'Credit Memo', '4': 'Vendor Bill' };
+    const SETTLE_RECTYPE = { '3': 'creditmemo',  '4': 'vendorbill'  };
+
     const onRequest = (context) => {
         try {
-            const params       = context.request.parameters;
-            const mrTaskId     = params.custpage_mr_task_id || '';
-            const batchId      = params.custpage_batch_id   || '';
-            const filterErrors = params.custpage_only_errors === 'T';
+            const params   = context.request.parameters;
+            const mrTaskId = params.custpage_mr_task_id || '';
+            const batchId  = params.custpage_batch_id   || '';
 
             const form = serverWidget.createForm({ title: 'Estado de Procesamiento — Liquidación de Rebates' });
 
             // ── URL del Dashboard generada correctamente con N/url ──────────────
-            const dashboardUrl = url.resolveScript({
-                scriptId:          'customscript_giv_sl_rebate_dashboard',
-                deploymentId:      'customdeploy_giv_sl_dashboard',
-                returnExternalUrl: false
-            });
+            let dashboardUrl = '/';
+            try {
+                dashboardUrl = url.resolveScript({
+                    scriptId:          'customscript_giv_sl_rebate_dashboard',
+                    deploymentId:      'customdeploy_giv_sl_dashboard',
+                    returnExternalUrl: false
+                });
+            } catch (urlErr) {
+                log.error({ title: `${MODULE}.dashboardUrl`, details: urlErr.message || urlErr });
+            }
+
 
             // ── Estado del MR Task ──────────────────────────────────────────────
             let taskStatus    = 'N/A';
@@ -49,18 +58,24 @@ define([
 
             // ── Auto-refresh cuando el MR sigue corriendo ──────────────────────
             if (taskIsPending) {
-                const refreshUrl = url.resolveScript({
-                    scriptId:          'customscript_giv_sl_rebate_status',
-                    deploymentId:      'customdeploy_giv_sl_status',
-                    params: { custpage_mr_task_id: mrTaskId, custpage_batch_id: batchId },
-                    returnExternalUrl: false
-                });
-                const autoFld = form.addField({ id: 'custpage_autorefresh', type: serverWidget.FieldType.INLINEHTML, label: ' ' });
-                autoFld.defaultValue = `
-                    <script>setTimeout(function(){ window.location.href='${refreshUrl}'; }, 8000);</script>
-                    <div style="background:#fff3cd;border:1px solid #ffc107;border-radius:6px;padding:10px 16px;margin:8px 0;font-size:13px;">
-                        ⏳ <strong>El proceso está corriendo.</strong> Esta pantalla se actualizará automáticamente en 8 segundos...
-                    </div>`;
+                let refreshUrl = '';
+                try {
+                    refreshUrl = url.resolveScript({
+                        scriptId:          'customscript_giv_sl_rebate_status',
+                        deploymentId:      'customdeploy_giv_sl_status',
+                        params:            { custpage_mr_task_id: mrTaskId, custpage_batch_id: batchId },
+                        returnExternalUrl: false
+                    });
+                } catch (e) { /* si falla, sin auto-refresh */ }
+
+                if (refreshUrl) {
+                    const autoFld = form.addField({ id: 'custpage_autorefresh', type: serverWidget.FieldType.INLINEHTML, label: ' ' });
+                    autoFld.defaultValue = `
+                        <script>setTimeout(function(){ window.location.href='${refreshUrl}'; }, 8000);</script>
+                        <div style="background:#fff3cd;border:1px solid #ffc107;border-radius:6px;padding:10px 16px;margin:8px 0;font-size:13px;">
+                            ⏳ <strong>El proceso está corriendo.</strong> Esta pantalla se actualizará automáticamente en 8 segundos...
+                        </div>`;
+                }
             }
 
             // ── Grupo de información del lote ──────────────────────────────────
@@ -102,7 +117,10 @@ define([
                     <div class="giv-card"><div class="num">${counters.validated}</div><div class="lbl">Validado</div></div>
                     <div class="giv-card"><div class="num">${counters.processing}</div><div class="lbl">Procesando</div></div>
                     <div class="giv-card"><div class="num">${counters.completed}</div><div class="lbl">Completado</div></div>
-                    <div class="giv-card"><div class="num">${counters.error}</div><div class="lbl">Error</div></div>
+                    <div class="giv-card" style="border-color:${counters.error > 0 ? '#e57373' : '#ddd'};background:${counters.error > 0 ? '#fff5f5' : '#f7f7f7'}">
+                        <div class="num" style="color:${counters.error > 0 ? '#c62828' : '#2c2c2c'}">${counters.error}</div>
+                        <div class="lbl">Error</div>
+                    </div>
                     <div class="giv-card" style="background:#efefef"><div class="num">${total}</div><div class="lbl">Total</div></div>
                 </div>
                 <div class="giv-progress">
@@ -118,14 +136,18 @@ define([
                 </div>`;
 
             // ── Sublista de registros WORK ──────────────────────────────────────
+            // Muestra todos los métodos de liquidación (CSV, Suitelet manual, etc.)
+            // Los errores se muestran inline en cada fila — sin botón separado.
             const workSublist = form.addSublist({
                 id:    'custpage_work_sublist',
                 type:  serverWidget.SublistType.LIST,
-                label: 'Detalle de Registros' + (filterErrors ? ' — Solo Errores' : '')
+                label: 'Detalle de Registros'
             });
 
             workSublist.addField({ id: 'custpage_wk_id',         type: serverWidget.FieldType.TEXT,     label: 'Work ID' });
             workSublist.addField({ id: 'custpage_wk_status',      type: serverWidget.FieldType.TEXT,     label: 'Estado' });
+            // Mensaje de Error: inmediatamente después de Estado para que sea visible sin scroll horizontal
+            workSublist.addField({ id: 'custpage_wk_error',       type: serverWidget.FieldType.TEXT,     label: 'Mensaje de Error' });
             workSublist.addField({ id: 'custpage_wk_scenario',    type: serverWidget.FieldType.TEXT,     label: 'Escenario' });
             workSublist.addField({ id: 'custpage_wk_type',        type: serverWidget.FieldType.TEXT,     label: 'Tipo Liq.' });
             workSublist.addField({ id: 'custpage_wk_customer',    type: serverWidget.FieldType.TEXT,     label: 'Cliente' });
@@ -133,48 +155,38 @@ define([
             workSublist.addField({ id: 'custpage_wk_invoice',     type: serverWidget.FieldType.TEXT,     label: 'Factura Origen' });
             workSublist.addField({ id: 'custpage_wk_item',        type: serverWidget.FieldType.TEXT,     label: 'Artículo' });
             workSublist.addField({ id: 'custpage_wk_amount',      type: serverWidget.FieldType.CURRENCY, label: 'Monto a Liquidar' });
+            // Transacción: justo después del monto para que sea visible rápidamente
+            workSublist.addField({ id: 'custpage_wk_transaction', type: serverWidget.FieldType.TEXT,     label: 'Transacción Generada' });
+            workSublist.addField({ id: 'custpage_wk_txn_link',    type: serverWidget.FieldType.URL,      label: 'Abrir Transacción' });
             workSublist.addField({ id: 'custpage_wk_invoice_to',  type: serverWidget.FieldType.TEXT,     label: 'Factura Destino' });
             workSublist.addField({ id: 'custpage_wk_apply_amt',   type: serverWidget.FieldType.CURRENCY, label: 'Monto a Aplicar' });
-            workSublist.addField({ id: 'custpage_wk_transaction', type: serverWidget.FieldType.TEXT,     label: 'Transacción Generada' });
-            workSublist.addField({ id: 'custpage_wk_error',       type: serverWidget.FieldType.TEXT,     label: 'Mensaje de Error' });
 
-            populateWorkSublist(workSublist, batchId, filterErrors);
+            populateWorkSublist(workSublist, batchId);
 
-            // ── Botones ─────────────────────────────────────────────────────────
-            const currentPageUrl = url.resolveScript({
-                scriptId:          'customscript_giv_sl_rebate_status',
-                deploymentId:      'customdeploy_giv_sl_status',
-                params:            { custpage_mr_task_id: mrTaskId, custpage_batch_id: batchId },
-                returnExternalUrl: false
-            });
-
-            form.addButton({
-                id:           'custpage_refresh',
-                label:        '↻ Actualizar Estado',
-                functionName: `window.location.href='${currentPageUrl}'`
-            });
-
-            if (counters.error > 0) {
-                const errorsUrl = url.resolveScript({
+            // ── Botón Actualizar Estado ─────────────────────────────────────────
+            let currentPageUrl = '';
+            try {
+                currentPageUrl = url.resolveScript({
                     scriptId:          'customscript_giv_sl_rebate_status',
                     deploymentId:      'customdeploy_giv_sl_status',
-                    params:            { custpage_mr_task_id: mrTaskId, custpage_batch_id: batchId, custpage_only_errors: 'T' },
+                    params:            { custpage_mr_task_id: mrTaskId, custpage_batch_id: batchId },
                     returnExternalUrl: false
                 });
+            } catch (e) { /* si falla, el botón queda sin acción */ }
+
+            if (currentPageUrl) {
                 form.addButton({
-                    id:           'custpage_filter_errors',
-                    label:        filterErrors ? 'Ver Todos' : `⚠ Ver Solo Errores (${counters.error})`,
-                    functionName: filterErrors
-                        ? `window.location.href='${currentPageUrl}'`
-                        : `window.location.href='${errorsUrl}'`
+                    id:           'custpage_refresh',
+                    label:        '↻ Actualizar Estado',
+                    functionName: `window.location.href="${currentPageUrl}"`
                 });
             }
 
-            // ── Botón Regresar — URL correcta generada con N/url ───────────────
+            // ── Botón Regresar al Dashboard (mismo nivel que Actualizar Estado) ──
             form.addButton({
                 id:           'custpage_back_dashboard',
                 label:        '← Regresar al Dashboard',
-                functionName: `window.location.href='${dashboardUrl}'`
+                functionName: `window.location.href="${dashboardUrl}"`
             });
 
             context.response.writePage(form);
@@ -187,6 +199,7 @@ define([
 
     /**
      * Contadores por estado + totales de monto (SUM).
+     * Si batchId está vacío, cuenta TODOS los registros WORK del sistema.
      */
     const getStatusCounters = (batchId) => {
         const counters = { captured: 0, validated: 0, processing: 0, completed: 0, error: 0, completedAmt: '0.00', errorAmt: '0.00' };
@@ -222,25 +235,21 @@ define([
     };
 
     /**
-     * Puebla la sublista con los campos del DRD:
-     * Estado, Escenario, Tipo Liquidación (CM / VB), Cliente, Acuerdo,
-     * Factura Origen, Artículo, Monto a Liquidar, Factura Destino,
-     * Monto a Aplicar, Transacción Generada, Mensaje de Error.
+     * Puebla la sublista con TODOS los registros WORK del lote (o del sistema si no hay batchId).
+     * Aplica a todos los métodos de liquidación: CSV, Dashboard manual, etc.
+     * Errores y transacciones se muestran inline en cada fila con formato HTML.
      */
-    const populateWorkSublist = (sublist, batchId, filterErrors) => {
+    const populateWorkSublist = (sublist, batchId) => {
         try {
             const filters = [['isinactive', 'is', 'F']];
-            if (batchId)      filters.push('AND', ['custrecord_giv_lw_csv_batch_id', 'is', batchId]);
-            if (filterErrors) filters.push('AND', ['custrecord_giv_lw_proc_status',  'is', 'Error']);
-
-            const SETTLE_LABEL = { '1': 'Vendor Bill', '3': 'Credit Memo' };
+            if (batchId) filters.push('AND', ['custrecord_giv_lw_csv_batch_id', 'is', batchId]);
 
             let lineIndex = 0;
             search.create({
                 type:    'customrecord_giv_rebate_liq_work',
                 filters: filters,
                 columns: [
-                    search.createColumn({ name: 'internalid',                       sort: search.Sort.DESC }),
+                    search.createColumn({ name: 'internalid',                        sort: search.Sort.DESC }),
                     search.createColumn({ name: 'custrecord_giv_lw_proc_status' }),
                     search.createColumn({ name: 'custrecord_giv_lw_scenario' }),
                     search.createColumn({ name: 'custrecord_giv_lw_settle_method' }),
@@ -257,29 +266,64 @@ define([
             }).run().each((result) => {
                 if (lineIndex >= 500) return false;
 
-                const settleMethod = result.getValue('custrecord_giv_lw_settle_method') || '';
-                const invTo        = result.getText('custrecord_giv_lw_invoice_to')     || '';
-                const applyAmt     = result.getValue('custrecord_giv_lw_apply_amount')  || '';
-                const txnText      = result.getText('custrecord_giv_lw_processed_tran') || '';
-                const errMsg       = result.getValue('custrecord_giv_lw_error_message') || '';
+                // ── Try-catch por fila: si una fila falla, las demás continúan ──
+                try {
+                    const wkId         = result.getValue('internalid')                        || '';
+                    // proc_status es campo TEXT → getValue (getText retorna '' en TEXT y lanza al setSublistValue)
+                    const wkStatus     = result.getValue('custrecord_giv_lw_proc_status')     || '';
+                    const wkScenario   = result.getValue('custrecord_giv_lw_scenario')         || '';
+                    const settleMethod = result.getValue('custrecord_giv_lw_settle_method')    || '';
+                    const customer     = result.getText('custrecord_giv_lw_customer')          || '';
+                    const agreement    = result.getText('custrecord_giv_lw_agreement')         || '';
+                    const invoice      = result.getText('custrecord_giv_lw_source_invoice')    || '';
+                    const item         = result.getText('custrecord_giv_lw_source_item')       || '';
+                    // CURRENCY: parseFloat para evitar SSS_INVALID_TYPE_ARG con strings
+                    const amtToSettle  = parseFloat(result.getValue('custrecord_giv_lw_amt_to_settle'))  || 0;
+                    const applyAmt     = parseFloat(result.getValue('custrecord_giv_lw_apply_amount'))   || 0;
+                    const invTo        = result.getText('custrecord_giv_lw_invoice_to')        || '';
+                    const txnId        = result.getValue('custrecord_giv_lw_processed_tran')   || '';
+                    const txnText      = result.getText('custrecord_giv_lw_processed_tran')    || '';
+                    const errMsg       = result.getValue('custrecord_giv_lw_error_message')    || '';
 
-                sublist.setSublistValue({ id: 'custpage_wk_id',        line: lineIndex, value: result.getValue('internalid')                        || '' });
-                sublist.setSublistValue({ id: 'custpage_wk_status',    line: lineIndex, value: result.getText('custrecord_giv_lw_proc_status')       || '' });
-                sublist.setSublistValue({ id: 'custpage_wk_scenario',  line: lineIndex, value: result.getValue('custrecord_giv_lw_scenario')         || '' });
-                sublist.setSublistValue({ id: 'custpage_wk_type',      line: lineIndex, value: SETTLE_LABEL[settleMethod] || settleMethod });
-                sublist.setSublistValue({ id: 'custpage_wk_customer',  line: lineIndex, value: result.getText('custrecord_giv_lw_customer')          || '' });
-                sublist.setSublistValue({ id: 'custpage_wk_agreement', line: lineIndex, value: result.getText('custrecord_giv_lw_agreement')         || '' });
-                sublist.setSublistValue({ id: 'custpage_wk_invoice',   line: lineIndex, value: result.getText('custrecord_giv_lw_source_invoice')    || '' });
-                sublist.setSublistValue({ id: 'custpage_wk_item',      line: lineIndex, value: result.getText('custrecord_giv_lw_source_item')       || '' });
-                sublist.setSublistValue({ id: 'custpage_wk_amount',    line: lineIndex, value: result.getValue('custrecord_giv_lw_amt_to_settle')    || '0' });
+                    // ── URL de la transacción generada (CM o VB) ──────────────
+                    let txnUrl = '';
+                    if (txnId) {
+                        try {
+                            const recType = SETTLE_RECTYPE[settleMethod];
+                            txnUrl = recType
+                                ? url.resolveRecord({ recordType: recType, recordId: txnId, isEditMode: false })
+                                : `/app/accounting/transactions/transact.nl?id=${txnId}`;
+                        } catch (e) {
+                            txnUrl = `/app/accounting/transactions/transact.nl?id=${txnId}`;
+                        }
+                    }
 
-                if (invTo)    sublist.setSublistValue({ id: 'custpage_wk_invoice_to', line: lineIndex, value: invTo });
-                if (applyAmt) sublist.setSublistValue({ id: 'custpage_wk_apply_amt',  line: lineIndex, value: applyAmt });
-                if (txnText)  sublist.setSublistValue({ id: 'custpage_wk_transaction', line: lineIndex, value: txnText });
-                if (errMsg)   sublist.setSublistValue({ id: 'custpage_wk_error',       line: lineIndex, value: errMsg.substring(0, 300) });
+                    // ── Campos siempre presentes ──────────────────────────────
+                    sublist.setSublistValue({ id: 'custpage_wk_id',       line: lineIndex, value: wkId });
+                    if (wkStatus)   sublist.setSublistValue({ id: 'custpage_wk_status',    line: lineIndex, value: wkStatus });
+                    if (errMsg)     sublist.setSublistValue({ id: 'custpage_wk_error',     line: lineIndex, value: errMsg.substring(0, 300) });
+                    if (wkScenario) sublist.setSublistValue({ id: 'custpage_wk_scenario',  line: lineIndex, value: wkScenario });
+                    if (settleMethod) sublist.setSublistValue({ id: 'custpage_wk_type',    line: lineIndex, value: SETTLE_LABEL[settleMethod] || settleMethod });
+                    if (customer)   sublist.setSublistValue({ id: 'custpage_wk_customer',  line: lineIndex, value: customer });
+                    if (agreement)  sublist.setSublistValue({ id: 'custpage_wk_agreement', line: lineIndex, value: agreement });
+                    if (invoice)    sublist.setSublistValue({ id: 'custpage_wk_invoice',   line: lineIndex, value: invoice });
+                    if (item)       sublist.setSublistValue({ id: 'custpage_wk_item',      line: lineIndex, value: item });
+                    if (amtToSettle) sublist.setSublistValue({ id: 'custpage_wk_amount',   line: lineIndex, value: amtToSettle });
+
+                    // ── Transacción generada (solo si existe) ─────────────────
+                    if (txnText) sublist.setSublistValue({ id: 'custpage_wk_transaction', line: lineIndex, value: txnText });
+                    if (txnUrl)  sublist.setSublistValue({ id: 'custpage_wk_txn_link',    line: lineIndex, value: txnUrl });
+
+                    // ── Campos opcionales de consolidada ──────────────────────
+                    if (invTo)     sublist.setSublistValue({ id: 'custpage_wk_invoice_to', line: lineIndex, value: invTo });
+                    if (applyAmt)  sublist.setSublistValue({ id: 'custpage_wk_apply_amt',  line: lineIndex, value: applyAmt });
+
+                } catch (rowErr) {
+                    log.error({ title: `${MODULE}.populateWorkSublist.row[${lineIndex}]`, details: rowErr.message || rowErr });
+                }
 
                 lineIndex++;
-                return true;
+                return true; // siempre continúa aunque la fila haya fallado
             });
 
         } catch (e) {
