@@ -633,13 +633,13 @@ define([
                 details: `Created ${workIds.length} WORK records. M/R task: ${mrTaskId}`
             });
 
-            // Redirect a pantalla de estado
+            // Redirect a pantalla de estado — pasar IDs exactos de los WORKs creados
             redirect.toSuitelet({
                 scriptId: 'customscript_giv_sl_rebate_status',
                 deploymentId: 'customdeploy_giv_sl_status',
                 parameters: {
                     custpage_mr_task_id: mrTaskId,
-                    custpage_work_count: workIds.length
+                    custpage_work_ids:   workIds.join(',')
                 }
             });
 

@@ -258,14 +258,54 @@ define([
 
                 } else {
                     // Escenarios 1, 2, 3 — solo registros de fuente (amountToSettle > 0) al CM
+
+                    // Consolidada: descripción enriquecida con nombre de acuerdo + tranid de factura origen.
+                    // Se hace un lookup por lote de las facturas únicas para no multiplicar llamadas a la API.
+                    let invoiceTranIdMap = {};
+                    if (scenario === 'Consolidada') {
+                        const uniqueInvoiceIds = [...new Set(
+                            workRecords
+                                .filter(wr => parseFloat(wr.amountToSettle) > 0 && wr.sourceInvoiceId)
+                                .map(wr => wr.sourceInvoiceId)
+                        )];
+
+                        uniqueInvoiceIds.forEach(invId => {
+                            try {
+                                const fields = search.lookupFields({
+                                    type:    search.Type.INVOICE,
+                                    id:      invId,
+                                    columns: ['tranid']
+                                });
+                                invoiceTranIdMap[invId] = fields.tranid || invId;
+                            } catch (le) {
+                                log.error({
+                                    title:   `${MODULE}.reduce.invoiceLookup`,
+                                    details: `No se pudo obtener tranid de factura ${invId}: ${le.message || le}`
+                                });
+                                invoiceTranIdMap[invId] = invId; // fallback: usar el ID interno
+                            }
+                        });
+                    }
+
+                    const agreementName = agreement.name || `Acuerdo ${agreementId}`;
+
                     cmLines = workRecords
                         .filter(wr => parseFloat(wr.amountToSettle) > 0)
-                        .map(wr => ({
-                            itemId: agreement.accounting_item,
-                            amount: parseFloat(wr.amountToSettle) || 0,
-                            taxCodeId: wr.taxCodeId,
-                            description: `Liquidación rebate - Acuerdo ${agreementId}`
-                        }));
+                        .map(wr => {
+                            let description;
+                            if (scenario === 'Consolidada') {
+                                const invoiceName = invoiceTranIdMap[wr.sourceInvoiceId] || wr.sourceInvoiceId;
+                                description = `${agreementName} - ${invoiceName}`;
+                            } else {
+                                description = `Liquidación rebate - Acuerdo ${agreementId}`;
+                            }
+                            return {
+                                itemId:      agreement.accounting_item,
+                                amount:      parseFloat(wr.amountToSettle) || 0,
+                                taxCodeId:   wr.taxCodeId,
+                                description: description
+                            };
+                        });
                 }
 
                 // Preparar aplicación de facturas destino
@@ -285,13 +325,15 @@ define([
                 }));
 
                 generatedTxnId = txnBuilder.createCreditMemo({
-                    customerId:       customerId,
-                    lines:            cmLines,
+                    customerId:          customerId,
+                    lines:               cmLines,
                     invoiceApplications: invoiceApplications,
-                    scenario:         scenario,
-                    accountingItemId: accountingItemId,
-                    taxDetailsLines:  taxDetailsLines,
-                    location:         locationId
+                    scenario:            scenario,
+                    accountingItemId:    accountingItemId,
+                    taxDetailsLines:     taxDetailsLines,
+                    location:            locationId,
+                    formId:              589  // RM Credit Memo Disbursement (confirmado vía CM80 en Sandbox)
+                    // settlementHistoryId se añade en Fase posterior (post-Claim)
                 });
                 transactionType = 'Credit Memo';
 
@@ -366,9 +408,56 @@ define([
                 });
             });
 
+            // ── Crear el Claim nativo del RM SuiteApp (no-bloqueante) ──────────────
+            // Flujo en 4 fases:
+            //   Fase 1: marca custrecord_rm_td_rebateselected = true en RTDs
+            //   Fase 2: crea el Claim
+            //   Fase 3: vincula RTDs al Claim (custrecord_rm_rtd_claim)
+            //   Fase 4: crea JE de reversa del Accrual (el Bundle no lo hace vía SuiteScript)
+            const accrualIds = [...new Set(workRecords.map(wr => wr.sourceAccrualId).filter(Boolean))];
+
+            // Monto liquidado por accrual (para la Fase 4 — JE de reversa)
+            const accrualAmounts = {};
+            workRecords.forEach(wr => {
+                const acId = wr.sourceAccrualId;
+                if (acId) accrualAmounts[acId] = (accrualAmounts[acId] || 0) + (parseFloat(wr.amountToSettle) || 0);
+            });
+
+            const claimId = txnBuilder.createNativeClaim({
+                agreementId:    agreementId,
+                customerId:     customerId,
+                totalAmount:    totalSettledInGroup,
+                transactionId:  generatedTxnId,
+                accrualIds:     accrualIds,
+                accrualAmounts: accrualAmounts
+            });
+
+            // ── Vincular Claim al Credit Memo (custbody_rm_tran_settlement_his_rel) ────────
+            // El campo se llena DESPUÉS de crear el Claim porque su ID no estaba
+            // disponible durante la creación del CM (FASE 3 retroactiva).
+            if (claimId && settlementMethod === '3') {
+                try {
+                    record.submitFields({
+                        type:   record.Type.CREDIT_MEMO,
+                        id:     generatedTxnId,
+                        values: { custbody_rm_tran_settlement_his_rel: parseInt(claimId, 10) }
+                    });
+
+                    log.audit({
+                        title:   `${MODULE}.reduce`,
+                        details: `Linked CM ${generatedTxnId} → Claim ${claimId} (custbody_rm_tran_settlement_his_rel)`
+                    });
+                } catch (linkErr) {
+                    log.error({
+                        title:   `${MODULE}.reduce.linkClaim`,
+                        details: `No se pudo vincular CM ${generatedTxnId} al Claim ${claimId}: ${linkErr.message || linkErr}`
+                    });
+                }
+            }
+
             log.audit({
                 title:   `${MODULE}.reduce`,
-                details: `Group ${context.key}: Generated ${transactionType} ${generatedTxnId} for ${workRecords.length} WORK records`
+                details: `Group ${context.key}: ${transactionType} ${generatedTxnId} | ${workRecords.length} WORKs | Accruals: [${accrualIds.join(', ')}] | Claim: ${claimId || 'N/A'}`
             });
 
         } catch (e) {

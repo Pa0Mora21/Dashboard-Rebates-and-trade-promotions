@@ -5,13 +5,55 @@
  *              Crea Settlement, Credit Memo (con aplicación automática y Tax Details Override),
  *              y Vendor Bill.
  */
-define(['N/record', 'N/log', 'N/runtime'], (record, log, runtime) => {
+define(['N/record', 'N/search', 'N/log', 'N/runtime'], (record, search, log, runtime) => {
 
     const MODULE = 'giv_rebate_transaction_builder';
 
     /**
+     * Busca dinámicamente el ID interno de un formulario de transacción por su nombre.
+     * Evita hardcodear IDs de formularios que varían entre ambientes (Sandbox / Production).
+     *
+     * @param {string} formName  - Nombre exacto del formulario (ej. 'RM Credit Memo Disbursement')
+     * @returns {number|null}    - Internal ID del formulario, o null si no se encontró
+     */
+    const resolveFormIdByName = (formName) => {
+        try {
+            const formSearch = search.create({
+                type: 'customform',
+                filters: [['name', 'is', formName]],
+                columns: [search.createColumn({ name: 'internalid' })]
+            });
+
+            let formId = null;
+            formSearch.run().each((result) => {
+                formId = parseInt(result.id, 10);
+                return false; // solo el primero
+            });
+
+            if (!formId) {
+                log.error({
+                    title:   `${MODULE}.resolveFormIdByName`,
+                    details: `No se encontró el formulario con nombre "${formName}". Se usará el formulario por defecto.`
+                });
+            }
+
+            return formId;
+        } catch (e) {
+            log.error({
+                title:   `${MODULE}.resolveFormIdByName`,
+                details: `Error al buscar formulario "${formName}": ${e.message || e}`
+            });
+            return null;
+        }
+    };
+
+    /**
      * Crea un Credit Memo con aplicación automática contra facturas destino.
      * Soporta Escenario 9 (Agrupación) con Tax Details Override.
+     *
+     * @param {Object}  params
+     * @param {string}  [params.formName]             Nombre del formulario personalizado a aplicar (buscado dinámicamente)
+     * @param {string}  [params.settlementHistoryId]  ID del registro de liquidación (custbody_rm_tran_settlement_his_rel)
      */
     const createCreditMemo = (params) => {
         try {
@@ -23,8 +65,20 @@ define(['N/record', 'N/log', 'N/runtime'], (record, log, runtime) => {
                 accountingItemId,
                 taxDetailsLines,
                 currency,
-                location
+                location,
+                formName,
+                formId,
+                settlementHistoryId
             } = params;
+
+            // Resolver el formulario: formId tiene prioridad (ID directo desde Script Parameter).
+            // Si no, se intenta resolver por nombre. Si ninguno, se usa el formulario por defecto.
+            let resolvedFormId = null;
+            if (formId > 0) {
+                resolvedFormId = formId;   // directo — sin búsqueda
+            } else if (formName) {
+                resolvedFormId = resolveFormIdByName(formName);
+            }
 
             const cmRec = record.create({
                 type: record.Type.CREDIT_MEMO,
@@ -33,6 +87,11 @@ define(['N/record', 'N/log', 'N/runtime'], (record, log, runtime) => {
                     entity: customerId
                 }
             });
+
+            // Aplicar formulario personalizado si se resolvió correctamente
+            if (resolvedFormId) {
+                cmRec.setValue({ fieldId: 'customform', value: resolvedFormId });
+            }
 
             if (currency) cmRec.setValue({ fieldId: 'currency', value: currency });
             if (location) cmRec.setValue({ fieldId: 'location', value: location });
@@ -85,41 +144,95 @@ define(['N/record', 'N/log', 'N/runtime'], (record, log, runtime) => {
 
             log.audit({
                 title: `${MODULE}.createCreditMemo`,
-                details: `Phase 1 — Created CM ${creditMemoId} for customer ${customerId}, scenario ${scenario}, ${lines.length} lines`
+                details: `Phase 1 — Created CM ${creditMemoId} for customer ${customerId}, scenario ${scenario}, ${lines.length} lines | Form: ${resolvedFormId || 'default'}`
             });
 
             // ── FASE 2: Cargar el CM guardado y aplicar contra facturas destino ───────
             // Solo si hay facturas destino. El reload garantiza que los impuestos
             // AT ya están calculados y el sublist 'apply' acepta los montos.
+            // RETRY: si el RM Bundle modifica el CM de forma asíncrona entre la carga
+            // y el save (causando "Record has been changed"), se recarga y reintenta.
             if (invoiceApplications && invoiceApplications.length > 0) {
-                const cmToApply = record.load({
-                    type: record.Type.CREDIT_MEMO,
-                    id: creditMemoId,
-                    isDynamic: true
-                });
+                const MAX_APPLY_RETRIES = 3;
+                let applied = false;
 
-                const applyCount = cmToApply.getLineCount({ sublistId: 'apply' });
-                let appliedCount = 0;
+                for (let attempt = 1; attempt <= MAX_APPLY_RETRIES; attempt++) {
+                    try {
+                        const cmToApply = record.load({
+                            type: record.Type.CREDIT_MEMO,
+                            id:   creditMemoId,
+                            isDynamic: true
+                        });
 
-                for (let i = 0; i < applyCount; i++) {
-                    const applyInvoiceId = cmToApply.getSublistValue({ sublistId: 'apply', fieldId: 'internalid', line: i });
-                    const matchedApp = invoiceApplications.find(app => String(app.invoiceId) === String(applyInvoiceId));
+                        const applyCount = cmToApply.getLineCount({ sublistId: 'apply' });
+                        let appliedCount = 0;
 
-                    if (matchedApp) {
-                        cmToApply.selectLine({ sublistId: 'apply', line: i });
-                        cmToApply.setCurrentSublistValue({ sublistId: 'apply', fieldId: 'apply', value: true });
-                        cmToApply.setCurrentSublistValue({ sublistId: 'apply', fieldId: 'amount', value: Math.round(parseFloat(matchedApp.amount) * 100) / 100 });
-                        cmToApply.commitLine({ sublistId: 'apply' });
-                        appliedCount++;
+                        for (let i = 0; i < applyCount; i++) {
+                            const applyInvoiceId = cmToApply.getSublistValue({ sublistId: 'apply', fieldId: 'internalid', line: i });
+                            const matchedApp = invoiceApplications.find(app => String(app.invoiceId) === String(applyInvoiceId));
+
+                            if (matchedApp) {
+                                cmToApply.selectLine({ sublistId: 'apply', line: i });
+                                cmToApply.setCurrentSublistValue({ sublistId: 'apply', fieldId: 'apply',  value: true });
+                                cmToApply.setCurrentSublistValue({ sublistId: 'apply', fieldId: 'amount', value: Math.round(parseFloat(matchedApp.amount) * 100) / 100 });
+                                cmToApply.commitLine({ sublistId: 'apply' });
+                                appliedCount++;
+                            }
+                        }
+
+                        cmToApply.save({ enableSourcing: true, ignoreMandatoryFields: false });
+
+                        log.audit({
+                            title:   `${MODULE}.createCreditMemo`,
+                            details: `Phase 2 — Applied CM ${creditMemoId} to ${appliedCount} invoice(s)${attempt > 1 ? ` (attempt ${attempt})` : ''}`
+                        });
+                        applied = true;
+                        break; // éxito — salir del loop
+
+                    } catch (applyErr) {
+                        const isStaleError = (applyErr.message || '').toLowerCase().includes('record has been changed');
+                        if (isStaleError && attempt < MAX_APPLY_RETRIES) {
+                            log.audit({
+                                title:   `${MODULE}.createCreditMemo`,
+                                details: `Phase 2 — "Record has been changed" en intento ${attempt}. Recargando CM ${creditMemoId} y reintentando...`
+                            });
+                            // continuar al siguiente intento con record.load() fresco
+                        } else {
+                            // Error no recuperable o máximo de reintentos alcanzado
+                            throw applyErr;
+                        }
                     }
                 }
 
-                cmToApply.save({ enableSourcing: true, ignoreMandatoryFields: false });
+                if (!applied) {
+                    throw new Error(`Phase 2 — No se pudo aplicar CM ${creditMemoId} a facturas destino tras ${MAX_APPLY_RETRIES} intentos.`);
+                }
+            }
 
-                log.audit({
-                    title: `${MODULE}.createCreditMemo`,
-                    details: `Phase 2 — Applied CM ${creditMemoId} to ${appliedCount} invoice(s)`
-                });
+
+            // ── FASE 3: Vincular CM a la liquidación (settlementHistoryId) ────────────
+            // Se ejecuta siempre que haya un settlementHistoryId, independientemente
+            // de si hubo aplicación de facturas. Usa submitFields para evitar recargar
+            // el registro completo y ahorrar governance.
+            if (settlementHistoryId) {
+                try {
+                    record.submitFields({
+                        type:   record.Type.CREDIT_MEMO,
+                        id:     creditMemoId,
+                        values: { custbody_rm_tran_settlement_his_rel: parseInt(settlementHistoryId, 10) }
+                    });
+
+                    log.audit({
+                        title:   `${MODULE}.createCreditMemo`,
+                        details: `Phase 3 — Linked CM ${creditMemoId} to settlement ${settlementHistoryId} (custbody_rm_tran_settlement_his_rel)`
+                    });
+                } catch (linkErr) {
+                    // No-bloqueante: el CM ya fue creado; solo se loguea el error
+                    log.error({
+                        title:   `${MODULE}.createCreditMemo`,
+                        details: `Phase 3 — No se pudo vincular CM ${creditMemoId} al settlement ${settlementHistoryId}: ${linkErr.message || linkErr}`
+                    });
+                }
             }
 
             return creditMemoId;
@@ -250,21 +363,31 @@ define(['N/record', 'N/log', 'N/runtime'], (record, log, runtime) => {
             workRec.setValue({ fieldId: 'custrecord_giv_lw_settle_method', value: String(data.settlementMethod || '') });
             workRec.setValue({ fieldId: 'custrecord_giv_lw_scenario', value: data.scenario });
 
-            // custrecord_giv_lw_source_accrual es MANDATORY (ismandatory=T).
-            // Se debe setear siempre, incluso cuando es '0' (sin accrual resuelto = error de trazabilidad).
-            // El if anterior con truthiness check lo omitía cuando era '0', causando "Field must contain a value".
-            workRec.setValue({ fieldId: 'custrecord_giv_lw_source_accrual', value: parseInt(data.sourceAccrualId, 10) || 0 });
+            // Campos MANDATORY de tipo List/Record: NO se puede pasar 0 a un campo List/Record
+            // (NetSuite lanza "Invalid Field Value 0" antes del save).
+            // Solo se setean si el valor es un ID positivo válido.
+            // Los WORKs de destino (Consolidada/Agrupación) usan ignoreMandatoryFields=true
+            // en el save() para omitir la validación de obligatoriedad cuando no hay origen.
+            const sourceAccrualVal = parseInt(data.sourceAccrualId, 10);
+            if (sourceAccrualVal > 0) {
+                workRec.setValue({ fieldId: 'custrecord_giv_lw_source_accrual', value: sourceAccrualVal });
+            }
 
-            workRec.setValue({ fieldId: 'custrecord_giv_lw_original_amt', value: parseFloat(data.originalAmount) || 0 });
+            workRec.setValue({ fieldId: 'custrecord_giv_lw_original_amt',  value: parseFloat(data.originalAmount)  || 0 });
             workRec.setValue({ fieldId: 'custrecord_giv_lw_available_amt', value: parseFloat(data.availableAmount) || 0 });
-            workRec.setValue({ fieldId: 'custrecord_giv_lw_amt_to_settle', value: parseFloat(data.amountToSettle) || 0 });
-            workRec.setValue({ fieldId: 'custrecord_giv_lw_proc_status', value: 'Capturado' });
-            workRec.setValue({ fieldId: 'custrecord_giv_lw_created_from', value: createdFrom });
+            workRec.setValue({ fieldId: 'custrecord_giv_lw_amt_to_settle', value: parseFloat(data.amountToSettle)  || 0 });
+            workRec.setValue({ fieldId: 'custrecord_giv_lw_proc_status',   value: 'Capturado' });
+            workRec.setValue({ fieldId: 'custrecord_giv_lw_created_from',  value: createdFrom });
 
-            // Campos MANDATORY según XML (ismandatory=T): siempre se setean aunque sean 0/vacío.
-            // Un if-check con truthiness los omitía cuando eran falsy, causando "Field must contain a value".
-            workRec.setValue({ fieldId: 'custrecord_giv_lw_source_invoice', value: parseInt(data.sourceInvoiceId, 10) || 0 });
-            workRec.setValue({ fieldId: 'custrecord_giv_lw_source_item',    value: parseInt(data.sourceItemId, 10) || 0 });
+            // List/Record: solo setear si hay un ID positivo válido
+            const sourceInvoiceVal = parseInt(data.sourceInvoiceId, 10);
+            if (sourceInvoiceVal > 0) {
+                workRec.setValue({ fieldId: 'custrecord_giv_lw_source_invoice', value: sourceInvoiceVal });
+            }
+            const sourceItemVal = parseInt(data.sourceItemId, 10);
+            if (sourceItemVal > 0) {
+                workRec.setValue({ fieldId: 'custrecord_giv_lw_source_item', value: sourceItemVal });
+            }
             if (data.returnsAmount) {
                 workRec.setValue({ fieldId: 'custrecord_giv_lw_returns_amt', value: parseFloat(data.returnsAmount) || 0 });
             }
@@ -422,11 +545,348 @@ define(['N/record', 'N/log', 'N/runtime'], (record, log, runtime) => {
         }
     };
 
+    /**
+     * Crea el registro nativo de liquidación del RM SuiteApp (customrecord_rm_claim).
+     *
+     * FLUJO EN DOS FASES:
+     *   FASE 1 — Marcar RTDs como “selected”:
+     *     Antes de crear el Claim, actualiza custrecord_rm_td_rebateselected = true
+     *     en los Transaction Details (RTDs) de cada Accrual liquidado.
+     *     Esto le indica al afterSubmit del Bundle qué accruals debe revertir.
+     *
+     *   FASE 2 — Crear el Claim:
+     *     Al guardarse, el afterSubmit del Bundle RM busca RTDs con
+     *     rebateselected = true para este Agreement y ejecuta:
+     *       · Generación del Journal Entry de reversa (custbody_rm_accrual_journal)
+     *       · Actualización de custrecord_rm_rtd_claim en cada RTD procesado
+     *       · Llenado de custbody_rm_tran_settlement_his_rel en el CM/VB
+     *
+     * ESTRATEGIA NO-BLOQUEANTE: cualquier fallo retorna null sin propagar el error.
+     * El proceso continúa con GIV_REBATE_LIQ_HISTORY como fuente de trazabilidad.
+     *
+     * @param {Object}   params
+     * @param {string}   params.agreementId     Internal ID del Rebate Agreement
+     * @param {string}   params.customerId       Internal ID del cliente o vendor
+     * @param {number}   params.totalAmount      Monto total liquidado
+     * @param {string}   params.transactionId    Internal ID del CM o VB generado
+     * @param {string[]} [params.accrualIds]     IDs de los Accruals a revertir
+     * @param {Date}     [params.startDate]      Fecha inicio del período (default: hoy)
+     * @param {Date}     [params.endDate]        Fecha fin del período (default: hoy)
+     * @returns {string|null}  Internal ID del Claim creado, o null si falló
+     */
+    const createNativeClaim = (params) => {
+        const {
+            agreementId,
+            customerId,
+            totalAmount,
+            transactionId,
+            accrualIds     = [],
+            accrualAmounts = {},   // { [accrualId]: settlementAmount }
+            startDate,
+            endDate
+        } = params;
+
+        const today      = new Date();
+        const claimStart = startDate instanceof Date ? startDate : today;
+        const claimEnd   = endDate   instanceof Date ? endDate   : today;
+
+        // ── FASE 1: Marcar RTDs como selected ─────────────────────────────────────
+        // El afterSubmit del Bundle lee esta marca para saber qué accruals revertir.
+        if (accrualIds.length > 0) {
+            try {
+                const rtdSearch = search.create({
+                    type: 'customrecord_rm_transaction_details',
+                    filters: [
+                        ['custrecord_rm_rtd_accrual', 'anyof', accrualIds],
+                        'AND',
+                        ['custrecord_rm_rtd_claim',   'isempty', ''],
+                        'AND',
+                        ['isinactive',                'is',       'F']
+                    ],
+                    columns: [search.createColumn({ name: 'internalid' })]
+                });
+
+                let rtdsMarked = 0;
+                rtdSearch.run().each(result => {
+                    const rtdId = result.getValue('internalid');
+                    if (!rtdId) return true;
+                    try {
+                        record.submitFields({
+                            type:   'customrecord_rm_transaction_details',
+                            id:     rtdId,
+                            values: { custrecord_rm_td_rebateselected: true }
+                        });
+                        rtdsMarked++;
+                    } catch (ue) {
+                        log.error({
+                            title:   `${MODULE}.createNativeClaim.markRTD`,
+                            details: `No se pudo marcar RTD ${rtdId}: ${ue.message || ue}`
+                        });
+                    }
+                    return true;
+                });
+
+                log.audit({
+                    title:   `${MODULE}.createNativeClaim`,
+                    details: `Fase 1 completada: ${rtdsMarked} RTD(s) marcados como selected | Accruals: [${accrualIds.join(', ')}]`
+                });
+
+            } catch (se) {
+                log.error({
+                    title:   `${MODULE}.createNativeClaim.searchRTD`,
+                    details: `Error buscando RTDs para marcar: ${se.message || se}`
+                });
+            }
+        }
+
+        // ── FASE 2: Crear el Claim ─────────────────────────────────────────────────
+        // El afterSubmit del Bundle RM encuentra los RTDs marcados en Fase 1
+        // y genera los JEs de reversa automáticamente.
+        try {
+            const claimRec = record.create({
+                type:      'customrecord_rm_claim',
+                isDynamic: false
+            });
+
+            claimRec.setValue({ fieldId: 'custrecord_rm_claim_rm_agreement',      value: parseInt(agreementId,   10) });
+            claimRec.setValue({ fieldId: 'custrecord_rm_claim_credit_entity',      value: parseInt(customerId,    10) });
+            claimRec.setValue({ fieldId: 'custrecord_rm_claim_total_claim_amount', value: Math.round(parseFloat(totalAmount) * 100) / 100 });
+            claimRec.setValue({ fieldId: 'custrecord_rm_claim_tran_number',        value: parseInt(transactionId, 10) });
+            claimRec.setValue({ fieldId: 'custrecord_rm_claim_date_gen',           value: today });
+            claimRec.setValue({ fieldId: 'custrecord_rm_claim_tran_start_date',    value: claimStart });
+            claimRec.setValue({ fieldId: 'custrecord_rm_claim_tran_end_date',      value: claimEnd });
+            claimRec.setValue({ fieldId: 'custrecord_rm_claim_gen_status',         value: 6 });     // Disbursement - Completed
+            claimRec.setValue({ fieldId: 'custrecord_rm_claim_mode',               value: 2 });     // CM y VB comparten valor
+            claimRec.setValue({ fieldId: 'custrecord_rm_claim_is_auto',            value: false });  // creado por script
+
+            const claimId = String(claimRec.save({
+                enableSourcing:        false,
+                ignoreMandatoryFields: true
+            }));
+
+            log.audit({
+                title:   `${MODULE}.createNativeClaim`,
+                details: `✅ Claim nativo creado: ${claimId} | Agreement: ${agreementId} | Txn: ${transactionId} | Monto: ${totalAmount}`
+            });
+
+            // ── FASE 3: Vincular RTDs al Claim recién creado ───────────────────────
+            // El Bundle no actualiza custrecord_rm_rtd_claim automáticamente.
+            // Lo hacemos nosotros sobre los RTDs que marcamos en Fase 1.
+            if (accrualIds.length > 0) {
+                try {
+                    const rtdLinkSearch = search.create({
+                        type: 'customrecord_rm_transaction_details',
+                        filters: [
+                            ['custrecord_rm_rtd_accrual',    'anyof', accrualIds],
+                            'AND',
+                            ['custrecord_rm_td_rebateselected', 'is', 'T'],
+                            'AND',
+                            ['custrecord_rm_rtd_claim',      'isempty', ''],
+                            'AND',
+                            ['isinactive',                   'is', 'F']
+                        ],
+                        columns: [search.createColumn({ name: 'internalid' })]
+                    });
+
+                    let rtdsLinked = 0;
+                    rtdLinkSearch.run().each(result => {
+                        const rtdId = result.getValue('internalid');
+                        if (!rtdId) return true;
+                        try {
+                            record.submitFields({
+                                type:   'customrecord_rm_transaction_details',
+                                id:     rtdId,
+                                values: {
+                                    custrecord_rm_rtd_claim:        parseInt(claimId, 10),
+                                    custrecord_rm_td_rebateselected: false   // resetear el flag
+                                }
+                            });
+                            rtdsLinked++;
+                        } catch (le) {
+                            log.error({
+                                title:   `${MODULE}.createNativeClaim.linkRTD`,
+                                details: `No se pudo vincular RTD ${rtdId} al Claim ${claimId}: ${le.message || le}`
+                            });
+                        }
+                        return true;
+                    });
+
+                    log.audit({
+                        title:   `${MODULE}.createNativeClaim`,
+                        details: `Fase 3 completada: ${rtdsLinked} RTD(s) vinculados al Claim ${claimId}`
+                    });
+
+                } catch (le) {
+                    log.error({
+                        title:   `${MODULE}.createNativeClaim.fase3`,
+                        details: `Error en Fase 3 (vincular RTDs): ${le.message || le}`
+                    });
+                }
+            }
+
+            // ── FASE 4: Crear Journal Entries de reversa ───────────────────────────
+            // El Bundle no los genera por SuiteScript, así que los creamos explícitamente.
+            if (accrualIds.length > 0) {
+                const jeIds = createReversalJournalEntries({
+                    accrualIds,
+                    accrualAmounts,
+                    claimId
+                });
+                log.audit({
+                    title:   `${MODULE}.createNativeClaim`,
+                    details: `Fase 4 completada: ${jeIds.length} JE(s) de reversa creados: [${jeIds.join(', ')}]`
+                });
+            }
+
+            return claimId;
+
+        } catch (e) {
+            log.audit({
+                title:   `${MODULE}.createNativeClaim`,
+                details: `⚠️ No se pudo crear el Claim nativo. ` +
+                         `Agreement: ${agreementId} | Txn: ${transactionId} | Error: ${e.message || e}`
+            });
+            return null;
+        }
+    };
+
+    /**
+     * Crea los Journal Entries de settlement del Accrual.
+     *
+     * El Bundle del RM SuiteApp no genera JEs automáticamente cuando el Claim
+     * se crea vía SuiteScript. Esta función replica ese comportamiento:
+     *   1. Busca el JE original del Accrual (custbody_rm_rebate_claim_journal IS NULL)
+     *   2. Carga sus líneas contables (cuentas, dimensiones)
+     *   3. Crea un nuevo JE con las mismas líneas por el monto liquidado
+     *   4. Vincula el JE al Journal original y al Claim vía custbody_rm_accrual_journal
+     *      y custbody_rm_rebate_claim_journal
+     *
+     * @param {Object}   params
+     * @param {string[]} params.accrualIds     IDs de los Accruals a revertir
+     * @param {Object}   params.accrualAmounts Mapa { accrualId: montoLiquidado }
+     * @param {string}   params.claimId        Internal ID del Claim
+     * @returns {string[]} IDs de los JEs creados
+     */
+    const createReversalJournalEntries = (params) => {
+        const { accrualIds, accrualAmounts, claimId } = params;
+        const today   = new Date();
+        const jeIds   = [];
+
+        accrualIds.forEach(accrualId => {
+            try {
+                const settlementAmount = Math.round(parseFloat(accrualAmounts[accrualId] || 0) * 100) / 100;
+                if (!settlementAmount) {
+                    log.error({ title: `${MODULE}.createReversalJE`, details: `Sin monto para Accrual ${accrualId}` });
+                    return;
+                }
+
+                // Buscar el JE original del Accrual (sin Claim = JE de Accrual, no de Settlement)
+                let originalJEId = null;
+                search.create({
+                    type: 'transaction',
+                    filters: [
+                        ['type',                              'anyof',    ['Journal']],
+                        'AND',
+                        ['custbody_rm_accrual_journal',       'anyof',    [accrualId]],
+                        'AND',
+                        ['custbody_rm_rebate_claim_journal',  'isempty',  '']
+                    ],
+                    columns: [search.createColumn({ name: 'internalid' })]
+                }).run().each(r => { originalJEId = r.getValue('internalid'); return false; });
+
+                if (!originalJEId) {
+                    log.error({ title: `${MODULE}.createReversalJE`, details: `No se encontró JE original para Accrual ${accrualId}` });
+                    return;
+                }
+
+                // Cargar JE original para leer cuentas, dimensiones y campos RM
+                const origJE      = record.load({ type: 'journalentry', id: originalJEId, isDynamic: false });
+                const lineCount   = origJE.getLineCount({ sublistId: 'line' });
+                const subId       = origJE.getValue({ fieldId: 'subsidiary' });
+                // custbody_rm_rebate_id_journal: ID del Rebate Agreement — tomado del JE original
+                const rebateIdJnl = origJE.getValue({ fieldId: 'custbody_rm_rebate_id_journal' });
+
+                // Crear JE de settlement (sin reversaldate — no se genera JE invertido automático)
+                const revJE = record.create({ type: 'journalentry', isDynamic: true });
+                revJE.setValue({ fieldId: 'subsidiary', value: subId });
+                revJE.setValue({ fieldId: 'trandate',   value: today });
+
+                // custbody_rm_accrual_journal apunta al Accrual Record del RM Bundle (customrecord_rm_accrual).
+                // IMPORTANTE: este campo acepta IDs de customrecord_rm_accrual, NO de journalentry.
+                revJE.setValue({ fieldId: 'custbody_rm_accrual_journal',      value: parseInt(accrualId,  10) });
+                revJE.setValue({ fieldId: 'custbody_rm_rebate_claim_journal', value: parseInt(claimId,    10) });
+                // custbody_rm_rebate_id_journal: mismo valor que el JE original del Accrual
+                if (rebateIdJnl) revJE.setValue({ fieldId: 'custbody_rm_rebate_id_journal', value: rebateIdJnl });
+
+                // reversalentry: vínculo visual al JE original del Accrual en UI de NetSuite.
+                // Se intenta setear; si el campo es read-only en este contexto, continúa sin error.
+                try {
+                    revJE.setValue({ fieldId: 'reversalentry', value: parseInt(originalJEId, 10) });
+                } catch (re) {
+                    log.debug({ title: `${MODULE}.createReversalJE`, details: `reversalentry read-only en este contexto: ${re.message || re}` });
+                }
+
+
+                for (let i = 0; i < lineCount; i++) {
+                    const acct   = origJE.getSublistValue({ sublistId: 'line', fieldId: 'account',     line: i });
+                    const debit  = parseFloat(origJE.getSublistValue({ sublistId: 'line', fieldId: 'debit',   line: i }) || 0);
+                    const cls    = origJE.getSublistValue({ sublistId: 'line', fieldId: 'class',       line: i });
+                    const loc    = origJE.getSublistValue({ sublistId: 'line', fieldId: 'location',    line: i });
+                    const dept   = origJE.getSublistValue({ sublistId: 'line', fieldId: 'department',  line: i });
+                    const marca  = origJE.getSublistValue({ sublistId: 'line', fieldId: 'cseg_marcas_giv',  line: i });
+                    const canal  = origJE.getSublistValue({ sublistId: 'line', fieldId: 'cseg_canal_distr', line: i });
+
+                    if (!acct) continue;
+
+                    revJE.selectNewLine({ sublistId: 'line' });
+                    revJE.setCurrentSublistValue({ sublistId: 'line', fieldId: 'account', value: acct });
+
+                    // Dirección INVERTIDA respecto al JE original:
+                    // si el accrual puso Débito → el settlement pone Crédito (signo negativo en accrual)
+                    // si el accrual puso Crédito → el settlement pone Débito
+                    if (debit > 0) {
+                        revJE.setCurrentSublistValue({ sublistId: 'line', fieldId: 'credit', value: settlementAmount });
+                    } else {
+                        revJE.setCurrentSublistValue({ sublistId: 'line', fieldId: 'debit',  value: settlementAmount });
+                    }
+
+                    if (cls)   revJE.setCurrentSublistValue({ sublistId: 'line', fieldId: 'class',           value: cls });
+                    if (loc)   revJE.setCurrentSublistValue({ sublistId: 'line', fieldId: 'location',        value: loc });
+                    if (dept)  revJE.setCurrentSublistValue({ sublistId: 'line', fieldId: 'department',      value: dept });
+                    if (marca) revJE.setCurrentSublistValue({ sublistId: 'line', fieldId: 'cseg_marcas_giv',  value: marca });
+                    if (canal) revJE.setCurrentSublistValue({ sublistId: 'line', fieldId: 'cseg_canal_distr', value: canal });
+
+                    revJE.commitLine({ sublistId: 'line' });
+                }
+
+                const newJEId = String(revJE.save({ enableSourcing: false, ignoreMandatoryFields: true }));
+                jeIds.push(newJEId);
+
+                log.audit({
+                    title:   `${MODULE}.createReversalJE`,
+                    details: `✅ JE de settlement creado: ${newJEId} | JE original: ${originalJEId} | Accrual: ${accrualId} | Claim: ${claimId} | Monto: ${settlementAmount}`
+                });
+
+            } catch (e) {
+                log.error({
+                    title:   `${MODULE}.createReversalJE`,
+                    details: `Error al crear JE de reversa para Accrual ${accrualId}: ${e.message || e}`
+                });
+            }
+        });
+
+        return jeIds;
+    };
+
     return {
+        resolveFormIdByName,
         createCreditMemo,
         createVendorBill,
+        createNativeClaim,
+        createReversalJournalEntries,
         createWorkRecord,
         createHistoryRecord,
         updateWorkRecord
     };
 });
+

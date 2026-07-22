@@ -125,7 +125,10 @@ COALESCE(
         0
     ) AS locked_amount,
 
-    /* Liquidado por GIV (WORK records Completados — CM/VB ya generados por nuestro sistema) */
+    /* [COMENTADO] Liquidado por GIV (WORK records Completados).
+       Se comenta porque GIV genera una liquidación nativa al completar,
+       por lo que ya queda capturado en settled_amount (Claim nativo).
+       Sumarlo aquí causaba doble conteo.
     COALESCE(
         (
             SELECT SUM(ABS(wc.custrecord_giv_lw_amt_to_settle))
@@ -136,6 +139,7 @@ COALESCE(
         ),
         0
     ) AS giv_settled_amount
+    */
 
 FROM customrecord_rm_transaction_details rtd
 
@@ -213,14 +217,20 @@ WHERE rtd.isinactive = 'F'
             log.debug({ title: `${MODULE}.getAvailableAccruals`, details: `Processing ${mappedResults.length} rows. First row: ${JSON.stringify(mappedResults[0])}` });
 
             mappedResults.forEach((row) => {
-                const accrualAmount    = parseFloat(row.accrual_detail_amount) || 0;
-                const settledAmount    = parseFloat(row.settled_amount)        || 0;  // Claim del SuiteApp
+                // achieved_rebate_amount = monto real liquidable (lo que el RM Bundle reconoce como rebate ganado)
+                // accrual_detail_amount  = monto bruto del RTD (puede incluir porción no liquidable)
+                // Usamos achieved_rebate_amount como base porque settled_amount también lo usa.
+                // Así: available = achieved - settled = 3.5 - 3.5 = 0 → no reaparece la provisión.
+                const achievedAmount   = parseFloat(row.achieved_rebate_amount) || 0;
+                const accrualAmount    = achievedAmount > 0 ? achievedAmount : (parseFloat(row.accrual_detail_amount) || 0);
+                const settledAmount    = parseFloat(row.settled_amount)        || 0;  // Claim del SuiteApp (incluye liquidaciones GIV)
                 const returnsAmount    = parseFloat(row.returns_amount)        || 0;
                 const lockedAmount     = parseFloat(row.locked_amount)         || 0;
-                const givSettledAmount = parseFloat(row.giv_settled_amount)    || 0;  // WORK Completados GIV
+                // const givSettledAmount = parseFloat(row.giv_settled_amount) || 0;  // [COMENTADO] doble conteo: GIV ya genera liquidación nativa
 
-                // Saldo disponible = Provisión − Liquidado SuiteApp − Liquidado GIV − Devoluciones
-                const available = accrualAmount - settledAmount - givSettledAmount - returnsAmount;
+                // Saldo disponible = Provisión (achieved) − Liquidado SuiteApp − Devoluciones
+                // (settled_amount ya incluye lo liquidado por GIV vía Claim nativo)
+                const available = accrualAmount - settledAmount - returnsAmount;
 
                 // Solo mostrar provisiones con saldo disponible mayor a 0.
                 // available = 0  → ya liquidado totalmente → excluir de la lista.
@@ -231,8 +241,8 @@ WHERE rtd.isinactive = 'F'
                         agreementId:      String(row.agreement_id),
                         agreementText:    row.agreement_name   || '',
                         accrualAmount:    accrualAmount,
-                        settledAmount:    settledAmount,        // Claim nativo SuiteApp
-                        givSettledAmount: givSettledAmount,     // WORK GIV Completados
+                        settledAmount:    settledAmount,        // Claim nativo SuiteApp (incluye liquidaciones GIV)
+                        // givSettledAmount: givSettledAmount,  // [COMENTADO] doble conteo
                         returnsAmount:    returnsAmount,
                         accrualDate:      row.accrual_date     || '',
                         invoiceNumber:    row.invoice_number   || 'N/A',
@@ -249,6 +259,7 @@ WHERE rtd.isinactive = 'F'
 
                 }
             });
+
 
             log.debug({ title: `${MODULE}.getAvailableAccruals`, details: `${results.length} provisiones disponibles` });
             return results;

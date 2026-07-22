@@ -26,6 +26,9 @@ define([
             const params   = context.request.parameters;
             const mrTaskId = params.custpage_mr_task_id || '';
             const batchId  = params.custpage_batch_id   || '';
+            // IDs exactos de los WORKs del proceso actual (enviados desde el Dashboard)
+            const workIdsRaw = params.custpage_work_ids || '';
+            const workIds    = workIdsRaw ? workIdsRaw.split(',').filter(Boolean) : [];
 
             const form = serverWidget.createForm({ title: 'Estado de Procesamiento — Liquidación de Rebates' });
 
@@ -60,10 +63,12 @@ define([
             if (taskIsPending) {
                 let refreshUrl = '';
                 try {
+                    const refreshParams = { custpage_mr_task_id: mrTaskId, custpage_batch_id: batchId };
+                    if (workIdsRaw) refreshParams.custpage_work_ids = workIdsRaw;
                     refreshUrl = url.resolveScript({
                         scriptId:          'customscript_giv_sl_rebate_status',
                         deploymentId:      'customdeploy_giv_sl_status',
-                        params:            { custpage_mr_task_id: mrTaskId, custpage_batch_id: batchId },
+                        params:            refreshParams,
                         returnExternalUrl: false
                     });
                 } catch (e) { /* si falla, sin auto-refresh */ }
@@ -94,7 +99,7 @@ define([
             batchFld.updateDisplayType({ displayType: serverWidget.FieldDisplayType.INLINE });
 
             // ── Contadores y barra de progreso ─────────────────────────────────
-            const counters = getStatusCounters(batchId);
+            const counters = getStatusCounters(batchId, workIds);
             const total    = counters.captured + counters.processing + counters.completed + counters.error + counters.validated;
             const pctDone  = total > 0 ? Math.round(((counters.completed + counters.error) / total) * 100) : 0;
             const pctOk    = total > 0 ? Math.round((counters.completed / total) * 100) : 0;
@@ -141,7 +146,7 @@ define([
             const workSublist = form.addSublist({
                 id:    'custpage_work_sublist',
                 type:  serverWidget.SublistType.LIST,
-                label: 'Detalle de Registros'
+                label: 'Detalle de Registros en Procesamiento Actual'
             });
 
             workSublist.addField({ id: 'custpage_wk_id',         type: serverWidget.FieldType.TEXT,     label: 'Work ID' });
@@ -161,15 +166,17 @@ define([
             workSublist.addField({ id: 'custpage_wk_invoice_to',  type: serverWidget.FieldType.TEXT,     label: 'Factura Destino' });
             workSublist.addField({ id: 'custpage_wk_apply_amt',   type: serverWidget.FieldType.CURRENCY, label: 'Monto a Aplicar' });
 
-            populateWorkSublist(workSublist, batchId);
+            populateWorkSublist(workSublist, batchId, workIds);
 
             // ── Botón Actualizar Estado ─────────────────────────────────────────
             let currentPageUrl = '';
             try {
+                const statusParams = { custpage_mr_task_id: mrTaskId, custpage_batch_id: batchId };
+                if (workIdsRaw) statusParams.custpage_work_ids = workIdsRaw;
                 currentPageUrl = url.resolveScript({
                     scriptId:          'customscript_giv_sl_rebate_status',
                     deploymentId:      'customdeploy_giv_sl_status',
-                    params:            { custpage_mr_task_id: mrTaskId, custpage_batch_id: batchId },
+                    params:            statusParams,
                     returnExternalUrl: false
                 });
             } catch (e) { /* si falla, el botón queda sin acción */ }
@@ -199,13 +206,19 @@ define([
 
     /**
      * Contadores por estado + totales de monto (SUM).
-     * Si batchId está vacío, cuenta TODOS los registros WORK del sistema.
+     * - Si workIds está presente → filtra exactamente esos registros (proceso actual del Dashboard).
+     * - Si batchId está presente → filtra por lote CSV.
+     * - Sin ninguno → cuenta TODOS los registros WORK del sistema.
      */
-    const getStatusCounters = (batchId) => {
+    const getStatusCounters = (batchId, workIds = []) => {
         const counters = { captured: 0, validated: 0, processing: 0, completed: 0, error: 0, completedAmt: '0.00', errorAmt: '0.00' };
         try {
             const filters = [['isinactive', 'is', 'F']];
-            if (batchId) filters.push('AND', ['custrecord_giv_lw_csv_batch_id', 'is', batchId]);
+            if (workIds.length > 0) {
+                filters.push('AND', ['internalid', 'anyof', workIds]);
+            } else if (batchId) {
+                filters.push('AND', ['custrecord_giv_lw_csv_batch_id', 'is', batchId]);
+            }
 
             search.create({
                 type:    'customrecord_giv_rebate_liq_work',
@@ -235,14 +248,39 @@ define([
     };
 
     /**
-     * Puebla la sublista con TODOS los registros WORK del lote (o del sistema si no hay batchId).
+     * Puebla la sublista con los registros WORK del proceso actual.
+     * - Si workIds está presente → filtra exactamente esos registros (Dashboard manual).
+     * - Si batchId está presente → filtra por lote CSV.
+     * - Sin ninguno → muestra todos (fallback).
+     * Solo incluye estados de procesamiento activo: Procesando, Completado, Error.
      * Aplica a todos los métodos de liquidación: CSV, Dashboard manual, etc.
-     * Errores y transacciones se muestran inline en cada fila con formato HTML.
+     * Errores y transacciones se muestran inline en cada fila.
      */
-    const populateWorkSublist = (sublist, batchId) => {
+    const populateWorkSublist = (sublist, batchId, workIds = []) => {
         try {
-            const filters = [['isinactive', 'is', 'F']];
-            if (batchId) filters.push('AND', ['custrecord_giv_lw_csv_batch_id', 'is', batchId]);
+            let filters;
+
+            if (workIds.length > 0) {
+                // Filtro exacto por IDs: mostramos todos los estados del proceso actual
+                // (incluyendo Capturado, que es el estado inicial antes de que el MR los procese)
+                filters = [
+                    ['isinactive', 'is', 'F'],
+                    'AND',
+                    ['internalid', 'anyof', workIds]
+                ];
+            } else {
+                // Sin IDs exactos: filtrar por estados activos para no mezclar
+                // registros de ejecuciones anteriores
+                const ACTIVE_STATUSES = ['Procesando', 'Completado', 'Error'];
+                filters = [
+                    ['isinactive', 'is', 'F'],
+                    'AND',
+                    ['custrecord_giv_lw_proc_status', 'anyof', ACTIVE_STATUSES]
+                ];
+                if (batchId) {
+                    filters.push('AND', ['custrecord_giv_lw_csv_batch_id', 'is', batchId]);
+                }
+            }
 
             let lineIndex = 0;
             search.create({
@@ -284,6 +322,14 @@ define([
                     const txnId        = result.getValue('custrecord_giv_lw_processed_tran')   || '';
                     const txnText      = result.getText('custrecord_giv_lw_processed_tran')    || '';
                     const errMsg       = result.getValue('custrecord_giv_lw_error_message')    || '';
+
+                    // ── Ocultar WORKs de destino puro (Consolidada/Agrupación/Exceso) ──
+                    // Estos WORKs internos registran la factura destino pero no tienen
+                    // monto ni factura origen — no aportan información útil al usuario.
+                    // Se usa getValue (ID interno) en vez de getText: getText en campos
+                    // List/Record vacíos puede retornar cadenas no vacías en NetSuite.
+                    const invoiceRawId = result.getValue('custrecord_giv_lw_source_invoice') || '';
+                    if (!invoiceRawId && amtToSettle === 0) return true; // saltar fila, no incrementar lineIndex
 
                     // ── URL de la transacción generada (CM o VB) ──────────────
                     let txnUrl = '';
