@@ -104,6 +104,7 @@ define(['N/record', 'N/search', 'N/log', 'N/runtime'], (record, search, log, run
                 cmRec.setCurrentSublistValue({ sublistId: 'item', fieldId: 'item', value: accountingItemId });
                 cmRec.setCurrentSublistValue({ sublistId: 'item', fieldId: 'amount', value: Math.round(totalAmount * 100) / 100 });
                 cmRec.setCurrentSublistValue({ sublistId: 'item', fieldId: 'description', value: 'Liquidación de reembolso comercial - Agrupación' });
+                if (location) cmRec.setCurrentSublistValue({ sublistId: 'item', fieldId: 'location', value: parseInt(location, 10) || location });
                 cmRec.commitLine({ sublistId: 'item' });
 
                 // Tax Details Override
@@ -126,6 +127,7 @@ define(['N/record', 'N/search', 'N/log', 'N/runtime'], (record, search, log, run
                     cmRec.setCurrentSublistValue({ sublistId: 'item', fieldId: 'item', value: line.itemId });
                     cmRec.setCurrentSublistValue({ sublistId: 'item', fieldId: 'amount', value: Math.round(parseFloat(line.amount) * 100) / 100 });
 
+                    if (location) cmRec.setCurrentSublistValue({ sublistId: 'item', fieldId: 'location', value: parseInt(location, 10) || location });
                     if (line.taxCodeId) {
                         cmRec.setCurrentSublistValue({ sublistId: 'item', fieldId: 'taxcode', value: line.taxCodeId });
                     }

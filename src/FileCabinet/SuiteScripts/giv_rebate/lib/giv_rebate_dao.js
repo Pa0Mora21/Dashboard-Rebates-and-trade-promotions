@@ -58,10 +58,30 @@ define(['N/search', 'N/query', 'N/record', 'N/log'], (search, query, record, log
     rtd.custrecord_rm_accrual_amo                     AS accrual_detail_amount,
     rtd.custrecord_rm_td_item_qty                     AS quantity,
 
-    /* Liquidado: solo se considera liquidado cuando existe Claim.
-   Si existe custrecord_rm_rtd_claim toma achieved_rebate_amount.
-   Si no existe Claim, no hay liquidación generada. */
+    /* Liquidado — lógica de prioridad para soportar liquidaciones parciales de GIV:
+       1. Si existen WORKs GIV Completados: usar su suma real (evita contar achieved_rebate_amount
+          completo cuando solo se liquidó una fracción).
+       2. Si no hay WORKs de GIV pero el RTD ya tiene un Claim nativo (liquidado fuera de GIV):
+          usar achieved_rebate_amount (comportamiento anterior para claims nativos puros).
+       3. Sin Claim ni WORKs: 0. */
         CASE
+            WHEN (
+                SELECT COUNT(*)
+                FROM customrecord_giv_rebate_liq_work wc_chk
+                WHERE wc_chk.custrecord_giv_lw_source_accrual = a.id
+                  AND wc_chk.custrecord_giv_lw_proc_status    = 'Completado'
+                  AND wc_chk.isinactive                       = 'F'
+            ) > 0
+            THEN COALESCE(
+                (
+                    SELECT SUM(ABS(wc.custrecord_giv_lw_amt_to_settle))
+                    FROM customrecord_giv_rebate_liq_work wc
+                    WHERE wc.custrecord_giv_lw_source_accrual = a.id
+                      AND wc.custrecord_giv_lw_proc_status    = 'Completado'
+                      AND wc.isinactive                       = 'F'
+                ),
+                0
+            )
             WHEN rtd.custrecord_rm_rtd_claim IS NOT NULL
             THEN COALESCE(rtd.custrecord_rm_achieved_rebate_amount, 0)
             ELSE 0
@@ -217,19 +237,35 @@ WHERE rtd.isinactive = 'F'
             log.debug({ title: `${MODULE}.getAvailableAccruals`, details: `Processing ${mappedResults.length} rows. First row: ${JSON.stringify(mappedResults[0])}` });
 
             mappedResults.forEach((row) => {
-                // achieved_rebate_amount = monto real liquidable (lo que el RM Bundle reconoce como rebate ganado)
-                // accrual_detail_amount  = monto bruto del RTD (puede incluir porción no liquidable)
-                // Usamos achieved_rebate_amount como base porque settled_amount también lo usa.
-                // Así: available = achieved - settled = 3.5 - 3.5 = 0 → no reaparece la provisión.
-                const achievedAmount   = parseFloat(row.achieved_rebate_amount) || 0;
-                const accrualAmount    = achievedAmount > 0 ? achievedAmount : (parseFloat(row.accrual_detail_amount) || 0);
-                const settledAmount    = parseFloat(row.settled_amount)        || 0;  // Claim del SuiteApp (incluye liquidaciones GIV)
-                const returnsAmount    = parseFloat(row.returns_amount)        || 0;
-                const lockedAmount     = parseFloat(row.locked_amount)         || 0;
-                // const givSettledAmount = parseFloat(row.giv_settled_amount) || 0;  // [COMENTADO] doble conteo: GIV ya genera liquidación nativa
+                // accrual_detail_amount  = monto del RTD de la factura origen (custrecord_rm_accrual_amo).
+                //                         Es el valor visible en la factura → base de "Original Provision".
+                // achieved_rebate_amount = monto liquidable calculado por el RM Bundle.
+                //                         Puede ser menor que accrual_amo cuando no se cumplen
+                //                         todos los umbrales del acuerdo.
+                const accrualDetailAmount = parseFloat(row.accrual_detail_amount)  || 0;
+                const achievedAmount      = parseFloat(row.achieved_rebate_amount) || 0;
 
-                // Saldo disponible = Provisión (achieved) − Liquidado SuiteApp − Devoluciones
-                // (settled_amount ya incluye lo liquidado por GIV vía Claim nativo)
+                // [FIX] Usar accrual_amo (lo que muestra la factura) como base de la provisión original.
+                // Antes se usaba achieved_rebate_amount, lo que causaba mostrar la mitad del valor real
+                // cuando achieved < accrual_amo (ej. INV123: accrual=$2.40, achieved=$1.20 → mostraba $1.20).
+                const accrualAmount = accrualDetailAmount > 0 ? accrualDetailAmount : achievedAmount;
+
+                const settledAmount = parseFloat(row.settled_amount) || 0;
+                const lockedAmount  = parseFloat(row.locked_amount)  || 0;
+
+                // [FIX] El RM Bundle ya calcula el accrual de la NC de forma proporcional:
+                //   devolver 1 de 2 unidades → RTD de la CM con accrual_amo = $1.20 (exacto).
+                // Aplicar achievedRatio encima de ese valor causaba doble reducción:
+                //   $1.20 × 0.50 = $0.60 en lugar de $1.20.
+                // Se usa returnsRaw directamente sin escalar.
+                //
+                // Escenario correcto post-fix:
+                //   INV123 (2 uds): accrual_amo=$2.40  → Original Provision = $2.40
+                //   CM     (1 ud):  return_raw =$1.20  → Returns            = $1.20
+                //   available = $2.40 − $0 − $1.20 = $1.20 ✓
+                const returnsAmount = parseFloat(row.returns_amount) || 0;
+
+                // Saldo disponible = Provisión original − Liquidado − Devoluciones
                 const available = accrualAmount - settledAmount - returnsAmount;
 
                 // Solo mostrar provisiones con saldo disponible mayor a 0.

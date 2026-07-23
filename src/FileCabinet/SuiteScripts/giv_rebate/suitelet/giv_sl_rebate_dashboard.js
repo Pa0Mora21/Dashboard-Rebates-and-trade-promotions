@@ -98,7 +98,7 @@ define([
             scenarioField.addSelectOption({ value: '', text: '' });
             scenarioField.addSelectOption({ value: 'Estándar', text: LBL.SCENARIO_STANDARD });
             scenarioField.addSelectOption({ value: 'Consolidada', text: LBL.SCENARIO_CONSOLIDATED });
-            scenarioField.addSelectOption({ value: 'Específica', text: LBL.SCENARIO_SPECIFIC });
+            scenarioField.addSelectOption({ value: 'Específica (por SKU)', text: LBL.SCENARIO_SPECIFIC });
             scenarioField.addSelectOption({ value: 'Cobro en exceso', text: LBL.SCENARIO_EXCESS });
             scenarioField.addSelectOption({ value: 'Agrupación', text: LBL.SCENARIO_GROUPED });
             scenarioField.isMandatory = true;

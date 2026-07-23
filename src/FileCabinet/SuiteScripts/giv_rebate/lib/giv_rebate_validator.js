@@ -119,7 +119,7 @@ define(['N/log', './giv_rebate_dao'], (log, dao) => {
                 }
                 break;
 
-            case 'Específica':
+            case 'Específica (por SKU)':
                 break;
 
             case 'Cobro en exceso':

@@ -17,11 +17,12 @@ define([
     'N/search',
     'N/runtime',
     'N/log',
+    'N/query',
     '../lib/giv_rebate_dao',
     '../lib/giv_rebate_validator',
     '../lib/giv_rebate_tax_utils',
     '../lib/giv_rebate_transaction_builder'
-], (record, search, runtime, log, dao, validator, taxUtils, txnBuilder) => {
+], (record, search, runtime, log, nsQuery, dao, validator, taxUtils, txnBuilder) => {
 
     const MODULE = 'giv_mr_rebate_liquidation';
 
@@ -181,6 +182,25 @@ define([
                 } catch (le) {
                     log.debug({ title: `${MODULE}.reduce.location`, details: `No se pudo leer location de invoice ${firstSourceRecord.sourceInvoiceId}: ${le.message}` });
                 }
+
+                // Fallback: en cuentas AT México la location está en las líneas, no en el header.
+                // Usamos SuiteQL directamente para garantizar el ID numérico correcto.
+                if (!locationId) {
+                    try {
+                        const sqlResult = nsQuery.runSuiteQL({
+                            query: `SELECT TOP 1 tl.location FROM transactionLine tl WHERE tl.transaction = ${firstSourceRecord.sourceInvoiceId} AND tl.mainline = 'F' AND tl.location IS NOT NULL`
+                        });
+                        if (sqlResult.results.length > 0) {
+                            const locValue = sqlResult.results[0].values[0];
+                            if (locValue) {
+                                locationId = String(locValue);
+                                log.audit({ title: `${MODULE}.reduce.location`, details: `Location leída vía SuiteQL de líneas de factura ${firstSourceRecord.sourceInvoiceId}: ${locationId}` });
+                            }
+                        }
+                    } catch (sqlErr) {
+                        log.error({ title: `${MODULE}.reduce.location`, details: `Error SuiteQL leyendo location de líneas de factura ${firstSourceRecord.sourceInvoiceId}: ${sqlErr.message}` });
+                    }
+                }
             }
 
             // Fallback: Script Parameter "Default Location"
@@ -289,23 +309,77 @@ define([
 
                     const agreementName = agreement.name || `Acuerdo ${agreementId}`;
 
-                    cmLines = workRecords
-                        .filter(wr => parseFloat(wr.amountToSettle) > 0)
-                        .map(wr => {
-                            let description;
-                            if (scenario === 'Consolidada') {
-                                const invoiceName = invoiceTranIdMap[wr.sourceInvoiceId] || wr.sourceInvoiceId;
-                                description = `${agreementName} - ${invoiceName}`;
-                            } else {
-                                description = `Liquidación rebate - Acuerdo ${agreementId}`;
+                    if (scenario === 'Específica (por SKU)') {
+                        // Agrupar por sourceItemId: 1 línea en el CM por SKU único.
+                        // Si varias provisiones comparten el mismo artículo, sus montos se suman.
+                        const skuMap = {};
+                        workRecords
+                            .filter(wr => parseFloat(wr.amountToSettle) > 0)
+                            .forEach(wr => {
+                                const skuKey = wr.sourceItemId || '__sin_sku__';
+                                if (!skuMap[skuKey]) {
+                                    skuMap[skuKey] = {
+                                        sourceItemId: wr.sourceItemId,           // para lookup de nombre y descripción
+                                        itemId:       agreement.accounting_item,  // ítem contable del acuerdo (OthCharge)
+                                        amount:       0,
+                                        taxCodeId:    wr.taxCodeId               // taxCode del primer WORK del SKU
+                                    };
+                                }
+                                skuMap[skuKey].amount += parseFloat(wr.amountToSettle) || 0;
+                            });
+
+                        // Lookup por lote de los nombres de artículo (campo 'itemid' = código/nombre en NS)
+                        // Patrón idéntico al lookup de tranid en Consolidada — una llamada por SKU único.
+                        const skuNameMap = {};
+                        Object.values(skuMap).forEach(sku => {
+                            if (!sku.sourceItemId) return;
+                            try {
+                                const itemFields = search.lookupFields({
+                                    type:    search.Type.ITEM,
+                                    id:      sku.sourceItemId,
+                                    columns: ['itemid', 'displayname']
+                                });
+                                skuNameMap[sku.sourceItemId] = itemFields.displayname || itemFields.itemid || String(sku.sourceItemId);
+                            } catch (ile) {
+                                log.error({
+                                    title:   `${MODULE}.reduce.itemLookup`,
+                                    details: `No se pudo obtener nombre del artículo ${sku.sourceItemId}: ${ile.message || ile}`
+                                });
+                                skuNameMap[sku.sourceItemId] = String(sku.sourceItemId); // fallback: usar el ID
                             }
-                            return {
-                                itemId:      agreement.accounting_item,
-                                amount:      parseFloat(wr.amountToSettle) || 0,
-                                taxCodeId:   wr.taxCodeId,
-                                description: description
-                            };
                         });
+
+                        cmLines = Object.values(skuMap).map(sku => ({
+                            itemId:      sku.itemId,                                                  // accounting_item del acuerdo
+                            amount:      Math.round(sku.amount * 100) / 100,
+                            taxCodeId:   sku.taxCodeId,
+                            description: `Liquidación rebate por SKU ${skuNameMap[sku.sourceItemId] || sku.sourceItemId || ''} - Acuerdo ${agreementId}`
+                        }));
+
+                        log.debug({
+                            title:   `${MODULE}.reduce.skuGrouping`,
+                            details: `Escenario SKU: ${Object.keys(skuMap).length} SKUs únicos → ${cmLines.length} líneas en CM | Acuerdo ${agreementId}`
+                        });
+
+                    } else {
+                        cmLines = workRecords
+                            .filter(wr => parseFloat(wr.amountToSettle) > 0)
+                            .map(wr => {
+                                let description;
+                                if (scenario === 'Consolidada') {
+                                    const invoiceName = invoiceTranIdMap[wr.sourceInvoiceId] || wr.sourceInvoiceId;
+                                    description = `${agreementName} - ${invoiceName}`;
+                                } else {
+                                    description = `Liquidación rebate - Acuerdo ${agreementId}`;
+                                }
+                                return {
+                                    itemId:      agreement.accounting_item,
+                                    amount:      parseFloat(wr.amountToSettle) || 0,
+                                    taxCodeId:   wr.taxCodeId,
+                                    description: description
+                                };
+                            });
+                    }
                 }
 
                 // Preparar aplicación de facturas destino
