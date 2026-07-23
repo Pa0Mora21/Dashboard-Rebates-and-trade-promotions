@@ -166,52 +166,57 @@ define([
             // Obtener detalles del acuerdo
             const agreement = dao.getAgreement(agreementId);
 
-            // ── Location: heredar de la factura origen (primer registro que tenga sourceInvoiceId) ──
-            // IMPORTANTE: no usar siempre firstRecord — en Consolidada puede ser un registro
-            // de destino (sourceInvoiceId vacío). Se busca el primer registro con sourceInvoiceId real.
-            let locationId = '';
-            const firstSourceRecord = workRecords.find(wr => wr.sourceInvoiceId) || null;
-            if (firstSourceRecord) {
-                try {
-                    const invFields = search.lookupFields({
-                        type:    search.Type.INVOICE,
-                        id:      firstSourceRecord.sourceInvoiceId,
-                        columns: ['location']
-                    });
-                    locationId = invFields.location?.[0]?.value || '';
-                } catch (le) {
-                    log.debug({ title: `${MODULE}.reduce.location`, details: `No se pudo leer location de invoice ${firstSourceRecord.sourceInvoiceId}: ${le.message}` });
-                }
+            // ── Location: DESHABILITADO ─────────────────────────────────────────────────
+            // La resolución de location (lookupFields → SuiteQL → Script Parameter) ya no
+            // es necesaria. El CM usa agreement.accounting_item (tipo OthCharge), que no
+            // requiere location a nivel de línea ni en el header del formulario 589.
+            // Se deja comentado como referencia por si en el futuro se usan otros ítems
+            // o formularios que sí requieran location.
+            //
+            // let locationId = '';
+            // const firstSourceRecord = workRecords.find(wr => wr.sourceInvoiceId) || null;
+            // if (firstSourceRecord) {
+            //     try {
+            //         const invFields = search.lookupFields({
+            //             type:    search.Type.INVOICE,
+            //             id:      firstSourceRecord.sourceInvoiceId,
+            //             columns: ['location']
+            //         });
+            //         locationId = invFields.location?.[0]?.value || '';
+            //     } catch (le) {
+            //         log.debug({ title: `${MODULE}.reduce.location`, details: `No se pudo leer location de invoice ${firstSourceRecord.sourceInvoiceId}: ${le.message}` });
+            //     }
+            //
+            //     // Fallback SuiteQL: en cuentas AT México la location está en las líneas, no en el header.
+            //     if (!locationId) {
+            //         try {
+            //             const sqlResult = nsQuery.runSuiteQL({
+            //                 query: `SELECT TOP 1 tl.location FROM transactionLine tl WHERE tl.transaction = ${firstSourceRecord.sourceInvoiceId} AND tl.mainline = 'F' AND tl.location IS NOT NULL`
+            //             });
+            //             if (sqlResult.results.length > 0) {
+            //                 const locValue = sqlResult.results[0].values[0];
+            //                 if (locValue) {
+            //                     locationId = String(locValue);
+            //                     log.audit({ title: `${MODULE}.reduce.location`, details: `Location leída vía SuiteQL de líneas de factura ${firstSourceRecord.sourceInvoiceId}: ${locationId}` });
+            //                 }
+            //             }
+            //         } catch (sqlErr) {
+            //             log.error({ title: `${MODULE}.reduce.location`, details: `Error SuiteQL leyendo location de líneas de factura ${firstSourceRecord.sourceInvoiceId}: ${sqlErr.message}` });
+            //         }
+            //     }
+            // }
+            //
+            // // Fallback: Script Parameter "Default Location"
+            // if (!locationId) {
+            //     locationId = runtime.getCurrentScript().getParameter({ name: 'custscript_giv_mr_default_location' }) || '';
+            //     if (locationId) {
+            //         log.debug({ title: `${MODULE}.reduce.location`, details: `Usando Default Location del Script Parameter: ${locationId}` });
+            //     } else {
+            //         log.audit({ title: `${MODULE}.reduce.location`, details: 'ADVERTENCIA: No se encontró Location en la factura origen ni en el Script Parameter. Si Location es obligatoria, el CM/VB fallará.' });
+            //     }
+            // }
+            const locationId = '';   // no requerida con accounting_item (OthCharge) + form 589
 
-                // Fallback: en cuentas AT México la location está en las líneas, no en el header.
-                // Usamos SuiteQL directamente para garantizar el ID numérico correcto.
-                if (!locationId) {
-                    try {
-                        const sqlResult = nsQuery.runSuiteQL({
-                            query: `SELECT TOP 1 tl.location FROM transactionLine tl WHERE tl.transaction = ${firstSourceRecord.sourceInvoiceId} AND tl.mainline = 'F' AND tl.location IS NOT NULL`
-                        });
-                        if (sqlResult.results.length > 0) {
-                            const locValue = sqlResult.results[0].values[0];
-                            if (locValue) {
-                                locationId = String(locValue);
-                                log.audit({ title: `${MODULE}.reduce.location`, details: `Location leída vía SuiteQL de líneas de factura ${firstSourceRecord.sourceInvoiceId}: ${locationId}` });
-                            }
-                        }
-                    } catch (sqlErr) {
-                        log.error({ title: `${MODULE}.reduce.location`, details: `Error SuiteQL leyendo location de líneas de factura ${firstSourceRecord.sourceInvoiceId}: ${sqlErr.message}` });
-                    }
-                }
-            }
-
-            // Fallback: Script Parameter "Default Location"
-            if (!locationId) {
-                locationId = runtime.getCurrentScript().getParameter({ name: 'custscript_giv_mr_default_location' }) || '';
-                if (locationId) {
-                    log.debug({ title: `${MODULE}.reduce.location`, details: `Usando Default Location del Script Parameter: ${locationId}` });
-                } else {
-                    log.audit({ title: `${MODULE}.reduce.location`, details: 'ADVERTENCIA: No se encontró Location en la factura origen ni en el Script Parameter. Si Location es obligatoria, el CM/VB fallará.' });
-                }
-            }
 
             let generatedTxnId = '';
             let transactionType = '';
