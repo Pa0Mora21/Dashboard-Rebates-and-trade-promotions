@@ -808,7 +808,11 @@ define(['N/record', 'N/search', 'N/log', 'N/runtime'], (record, search, log, run
                 // custbody_rm_rebate_id_journal: ID del Rebate Agreement — tomado del JE original
                 const rebateIdJnl = origJE.getValue({ fieldId: 'custbody_rm_rebate_id_journal' });
 
-                // Crear JE de settlement (sin reversaldate — no se genera JE invertido automático)
+                // Crear JE de settlement (sin reversaldate — poner reversaldate generaría un 2° JE automático no deseado)
+                // isDynamic: false — requerido para poder usar submitFields después del save().
+                // NOTA: reversalentry es read-only durante la creación del registro en NetSuite:
+                // setValue() lo acepta en memoria pero lo descarta al save() sin lanzar excepción
+                // (por eso el try/catch anterior nunca entraba al catch). Se setea con submitFields post-save.
                 const revJE = record.create({ type: 'journalentry', isDynamic: true });
                 revJE.setValue({ fieldId: 'subsidiary', value: subId });
                 revJE.setValue({ fieldId: 'trandate',   value: today });
@@ -819,14 +823,6 @@ define(['N/record', 'N/search', 'N/log', 'N/runtime'], (record, search, log, run
                 revJE.setValue({ fieldId: 'custbody_rm_rebate_claim_journal', value: parseInt(claimId,    10) });
                 // custbody_rm_rebate_id_journal: mismo valor que el JE original del Accrual
                 if (rebateIdJnl) revJE.setValue({ fieldId: 'custbody_rm_rebate_id_journal', value: rebateIdJnl });
-
-                // reversalentry: vínculo visual al JE original del Accrual en UI de NetSuite.
-                // Se intenta setear; si el campo es read-only en este contexto, continúa sin error.
-                try {
-                    revJE.setValue({ fieldId: 'reversalentry', value: parseInt(originalJEId, 10) });
-                } catch (re) {
-                    log.debug({ title: `${MODULE}.createReversalJE`, details: `reversalentry read-only en este contexto: ${re.message || re}` });
-                }
 
 
                 for (let i = 0; i < lineCount; i++) {
@@ -864,10 +860,30 @@ define(['N/record', 'N/search', 'N/log', 'N/runtime'], (record, search, log, run
                 const newJEId = String(revJE.save({ enableSourcing: false, ignoreMandatoryFields: true }));
                 jeIds.push(newJEId);
 
-                log.audit({
-                    title:   `${MODULE}.createReversalJE`,
-                    details: `✅ JE de settlement creado: ${newJEId} | JE original: ${originalJEId} | Accrual: ${accrualId} | Claim: ${claimId} | Monto: ${settlementAmount}`
-                });
+                // reversalentry: vincula visualmente el JE de reversa al JE original del accrual.
+                // Se setea con submitFields DESPUÉS del save porque durante la creación NetSuite
+                // acepta el valor en memoria pero lo descarta silenciosamente (sin lanzar excepción).
+                // Con submitFields el campo sí persiste y el JE aparece como "Reversal Approved for Posting".
+                try {
+                    record.submitFields({
+                        type:   'journalentry',
+                        id:     newJEId,
+                        values: { reversalentry: parseInt(originalJEId, 10) }
+                    });
+                    log.audit({
+                        title:   `${MODULE}.createReversalJE`,
+                        details: `✅ JE de reversa creado: ${newJEId} | JE original (accrual): ${originalJEId} | Accrual: ${accrualId} | Claim: ${claimId} | Monto: ${settlementAmount} | reversalentry vinculado`
+                    });
+                } catch (re) {
+                    log.error({
+                        title:   `${MODULE}.createReversalJE`,
+                        details: `JE ${newJEId} creado pero no se pudo vincular reversalentry al JE original ${originalJEId}: ${re.message || re}`
+                    });
+                    log.audit({
+                        title:   `${MODULE}.createReversalJE`,
+                        details: `⚠️ JE de reversa creado: ${newJEId} | JE original (accrual): ${originalJEId} | Accrual: ${accrualId} | Claim: ${claimId} | Monto: ${settlementAmount} | reversalentry NO vinculado`
+                    });
+                }
 
             } catch (e) {
                 log.error({

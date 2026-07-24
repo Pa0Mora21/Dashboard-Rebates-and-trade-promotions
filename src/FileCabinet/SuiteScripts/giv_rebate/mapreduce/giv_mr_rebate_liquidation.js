@@ -495,11 +495,19 @@ define([
             //   Fase 4: crea JE de reversa del Accrual (el Bundle no lo hace vía SuiteScript)
             const accrualIds = [...new Set(workRecords.map(wr => wr.sourceAccrualId).filter(Boolean))];
 
-            // Monto liquidado por accrual (para la Fase 4 — JE de reversa)
+            // Monto para el JE de reversa por accrual (Fase 4 del Claim).
+            // · Cobro en exceso: el JE revierte solo la provisión disponible (cap = availableAmount).
+            //   El CM va por el monto total (amountToSettle, que incluye el excedente).
+            //   Ej: provisión = 10, solicitado = 12 → JE revierte 10, CM va por 12. (DRD)
+            // · Resto de escenarios: usa amountToSettle completo.
             const accrualAmounts = {};
             workRecords.forEach(wr => {
                 const acId = wr.sourceAccrualId;
-                if (acId) accrualAmounts[acId] = (accrualAmounts[acId] || 0) + (parseFloat(wr.amountToSettle) || 0);
+                if (!acId) return;
+                const reverseAmount = scenario === 'Cobro en exceso'
+                    ? Math.min(parseFloat(wr.amountToSettle) || 0, parseFloat(wr.availableAmount) || 0)
+                    : (parseFloat(wr.amountToSettle) || 0);
+                accrualAmounts[acId] = (accrualAmounts[acId] || 0) + reverseAmount;
             });
 
             const claimId = txnBuilder.createNativeClaim({

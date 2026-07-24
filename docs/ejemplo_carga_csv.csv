@@ -1,5 +1,10 @@
-External ID,Cliente (Internal ID),Agreement (Internal ID),Tipo de liquidación,Factura Origen (Internal ID),Artículo (Internal ID),Monto a Liquidar,Factura Destino (Internal ID),Monto a Aplicar
-LIQ-2026-001,141,1,Estándar,10455,311,7.00,10773,7.00
-LIQ-2026-002,141,4,Consolidada,10455,647,29.64,9638,29.64
-LIQ-2026-002,141,3,Consolidada,10455,647,86.56,9638,86.56
-LIQ-2026-003,141,9,Estándar,10773,311,0.15,,
+External ID,Cliente (ID o nombre),Agreement (ID o nombre),Tipo de liquidación,Factura Origen (tranid o ID),Artículo (itemid o ID),Monto a Liquidar,Factura Destino (tranid o ID),Monto a Aplicar
+LIQ-EST-CM-2026-001,141,Test Walmart,Estándar,INV124,05392007-T,5.00,INV118,5.00
+LIQ-EST-VB-2026-001,141,Test- Bill,Estándar,INV123,05351001,2.00,,
+LIQ-CON-2026-001,141,Test Walmart,Consolidada,INV127,05374013-T,3.00,INV112,3.00
+LIQ-CON-2026-001,141,Test Walmart,Consolidada,INV111,05351001,3.00,INV112,3.00
+LIQ-SKU-2026-001,141,Test Walmart,Específica (por SKU),INV123,05351001,5.00,INV110,5.00
+LIQ-EXC-CM-2026-001,141,Test Walmart,Cobro en exceso,INV123,05374013-T,2.00,INV109,2.00
+LIQ-EXC-VB-2026-001,141,Test- Bill,Cobro en exceso,INV118,05351001,3.00,,
+LIQ-AGR-2026-001,141,Test Walmart,Agrupación,INV123,05392007-T,1.00,INV126,1.00
+LIQ-AGR-2026-001,141,Test Walmart,Agrupación,INV31,05351001,2.00,INV126,2.00

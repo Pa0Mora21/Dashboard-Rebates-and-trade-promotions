@@ -261,25 +261,39 @@ define([
             let filters;
 
             if (workIds.length > 0) {
-                // Filtro exacto por IDs: mostramos todos los estados del proceso actual
-                // (incluyendo Capturado, que es el estado inicial antes de que el MR los procese)
+                // Filtro exacto por IDs (viene del Dashboard manual): sin filtro de estado,
+                // mostramos todos los estados de esos WORKs exactos.
                 filters = [
                     ['isinactive', 'is', 'F'],
                     'AND',
                     ['internalid', 'anyof', workIds]
                 ];
-            } else {
-                // Sin IDs exactos: filtrar por estados activos para no mezclar
-                // registros de ejecuciones anteriores
-                const ACTIVE_STATUSES = ['Procesando', 'Completado', 'Error'];
+            } else if (batchId) {
+                // CSV Upload: filtrar solo por batchId — ya estamos acotados a ese lote,
+                // no hace falta filtrar por estado (evita problemas con anyof en campo texto).
                 filters = [
                     ['isinactive', 'is', 'F'],
                     'AND',
-                    ['custrecord_giv_lw_proc_status', 'anyof', ACTIVE_STATUSES]
+                    ['custrecord_giv_lw_csv_batch_id', 'is', batchId]
                 ];
-                if (batchId) {
-                    filters.push('AND', ['custrecord_giv_lw_csv_batch_id', 'is', batchId]);
-                }
+            } else {
+                // Sin batchId ni workIds (acceso directo a la pantalla): mostrar solo
+                // WORKs activos recientes para evitar cargar todos los registros del sistema.
+                filters = [
+                    ['isinactive', 'is', 'F'],
+                    'AND',
+                    [
+                        ['custrecord_giv_lw_proc_status', 'is', 'Capturado'],
+                        'OR',
+                        ['custrecord_giv_lw_proc_status', 'is', 'Validado'],
+                        'OR',
+                        ['custrecord_giv_lw_proc_status', 'is', 'Procesando'],
+                        'OR',
+                        ['custrecord_giv_lw_proc_status', 'is', 'Completado'],
+                        'OR',
+                        ['custrecord_giv_lw_proc_status', 'is', 'Error']
+                    ]
+                ];
             }
 
             let lineIndex = 0;

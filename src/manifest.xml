@@ -5,6 +5,8 @@
     <features>
       <feature required="true">CUSTOMRECORDS</feature>
       <feature required="true">SERVERSIDESCRIPTING</feature>
+      <feature required="true">ACCOUNTING</feature>
+      <feature required="true">LOCATIONS</feature>
     </features>
   </dependencies>
 </manifest>
