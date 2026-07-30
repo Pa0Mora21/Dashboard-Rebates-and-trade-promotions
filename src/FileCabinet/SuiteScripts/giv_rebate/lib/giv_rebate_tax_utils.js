@@ -3,13 +3,19 @@
  * @NModuleScope SameAccount
  * @description Utilidades fiscales para manejo de Tax Details Override (Escenario 9)
  *              y herencia de programas fiscales desde la factura origen.
+ *
+ *  Flujo Escenario 9 (Agrupación):
+ *  1. enrichWithTaxInfo(workRecords) → lee TODOS los impuestos de cada item/factura
+ *  2. buildTaxDetailsOverride(enrichedRecords) → agrupa por taxCodeId sumando bases
+ *  3. El transaction_builder inyecta las líneas resultantes en la sublista taxdetails del CM
  */
 define(['N/log', './giv_rebate_dao'], (log, dao) => {
 
     const MODULE = 'giv_rebate_tax_utils';
 
     /**
-     * Obtiene el Tax Schedule/Code de un artículo en la factura origen.
+     * Obtiene el Tax Schedule/Code de un artículo en la factura origen (UN solo impuesto).
+     * Usado por escenarios 1-4 donde cada línea del CM lleva su propio taxcode.
      */
     const getTaxScheduleFromSourceInvoice = (invoiceId, itemId) => {
         try {
@@ -24,39 +30,93 @@ define(['N/log', './giv_rebate_dao'], (log, dao) => {
     };
 
     /**
-     * Construye las líneas para la sublista taxdetails agrupando por código de impuesto.
-     * Se usa en el Escenario 9 (Agrupación).
+     * Enriquece registros WORK con TODOS los detalles fiscales de la factura origen.
+     * Cada WORK recibe un array 'taxDetails' con todas las líneas de impuesto
+     * (ej. [{taxCodeId: '612', taxRate: 8, taxBasis: 1, taxAmount: 0.08},
+     *       {taxCodeId: '634', taxRate: 0, taxBasis: 1, taxAmount: 0}])
+     *
+     * @param {Object[]} workRecords  Registros WORK filtrados (solo fuente, amountToSettle > 0)
+     * @returns {Object[]}  workRecords enriquecidos con propiedad 'taxDetails' (array)
      */
-    const buildTaxDetailsOverride = (workRecords) => {
+    const enrichWithTaxInfo = (workRecords) => {
+        try {
+            return workRecords.map((wr) => {
+                const invoiceId = wr.sourceInvoiceId || '';
+                const itemId    = wr.sourceItemId || '';
+                const amount    = parseFloat(wr.amountToSettle || 0);
+
+                if (!invoiceId || !itemId) return { ...wr, taxDetails: [] };
+
+                // Leer TODOS los impuestos de esa línea (IEPS + IVA, etc.)
+                const taxDetails = dao.getAllTaxDetailsFromInvoiceLine(invoiceId, itemId, amount);
+
+                log.debug({
+                    title: `${MODULE}.enrichWithTaxInfo`,
+                    details: `WORK inv=${invoiceId}, item=${itemId}, amt=${amount} → ${taxDetails.length} tax lines`
+                });
+
+                return { ...wr, taxDetails };
+            });
+
+        } catch (e) {
+            log.error({
+                title: `${MODULE}.enrichWithTaxInfo`,
+                details: `[workRecords=${workRecords.length}] ${e.message || e}`
+            });
+            return workRecords;
+        }
+    };
+
+    /**
+     * Construye las líneas para la sublista taxdetails del CM agrupando por código de impuesto.
+     * Suma taxBasis y taxAmount de todos los WORK records para cada taxCodeId.
+     *
+     * Ejemplo con 2 provisiones:
+     *   WR1: [{IEPS 8%, basis: 1, amt: 0.08}, {IVA 0%, basis: 1, amt: 0}]
+     *   WR2: [{IEPS 8%, basis: 2, amt: 0.16}, {IVA 0%, basis: 2, amt: 0}]
+     * Resultado:
+     *   [{IEPS 8%, basis: 3, amt: 0.24}, {IVA 0%, basis: 3, amt: 0}]
+     *
+     * @param {Object[]} enrichedRecords  WORKs con propiedad 'taxDetails' (del enrichWithTaxInfo)
+     * @returns {Array<{taxCodeId: string, taxBasis: number, taxAmount: number, taxRate: number}>}
+     */
+    const buildTaxDetailsOverride = (enrichedRecords) => {
         try {
             const taxGroups = {};
 
-            workRecords.forEach((wr) => {
-                const taxCode = wr.taxScheduleId || wr.custrecord_giv_liq_work_taxcode || '';
-                if (!taxCode) return;
+            enrichedRecords.forEach((wr) => {
+                const details = wr.taxDetails || [];
+                details.forEach((td) => {
+                    const key = td.taxCodeId;
+                    if (!key) return;
 
-                if (!taxGroups[taxCode]) {
-                    taxGroups[taxCode] = {
-                        taxCodeId: taxCode,
-                        taxBasis: 0,
-                        taxRate: wr.taxRate || 0,
-                        taxAmount: 0
-                    };
-                }
+                    if (!taxGroups[key]) {
+                        taxGroups[key] = {
+                            taxCodeId: key,
+                            taxRate:   td.taxRate || 0,
+                            taxType:   td.taxType || '',
+                            taxBasis:  0,
+                            taxAmount: 0
+                        };
+                    }
 
-                const basis = parseFloat(wr.taxBasis || wr.custrecord_giv_liq_work_tax_basis || wr.amountToSettle || 0);
-                taxGroups[taxCode].taxBasis += basis;
+                    taxGroups[key].taxBasis  += td.taxBasis  || 0;
+                    taxGroups[key].taxAmount += td.taxAmount || 0;
+                });
             });
 
-            const taxLines = Object.values(taxGroups).map((group) => {
-                group.taxBasis = Math.round(group.taxBasis * 100) / 100;
-                group.taxAmount = Math.round(group.taxBasis * (group.taxRate / 100) * 100) / 100;
-                return group;
-            });
+            // Redondear a 2 decimales
+            const taxLines = Object.values(taxGroups).map((group) => ({
+                taxCodeId: group.taxCodeId,
+                taxRate:   group.taxRate,
+                taxType:   group.taxType,
+                taxBasis:  Math.round(group.taxBasis * 100) / 100,
+                taxAmount: Math.round(group.taxAmount * 100) / 100
+            }));
 
-            log.debug({
+            log.audit({
                 title: `${MODULE}.buildTaxDetailsOverride`,
-                details: `Built ${taxLines.length} tax detail lines from ${workRecords.length} work records`
+                details: `Built ${taxLines.length} tax detail lines from ${enrichedRecords.length} work records: ${JSON.stringify(taxLines)}`
             });
 
             return taxLines;
@@ -64,7 +124,7 @@ define(['N/log', './giv_rebate_dao'], (log, dao) => {
         } catch (e) {
             log.error({
                 title: `${MODULE}.buildTaxDetailsOverride`,
-                details: `[workRecords=${workRecords.length}] ${e.message || e}`
+                details: `[workRecords=${enrichedRecords.length}] ${e.message || e}`
             });
             throw e;
         }
@@ -95,38 +155,6 @@ define(['N/log', './giv_rebate_dao'], (log, dao) => {
                 details: `${e.message || e}`
             });
             return {};
-        }
-    };
-
-    /**
-     * Enriquece registros WORK con información fiscal de la factura origen.
-     */
-    const enrichWithTaxInfo = (workRecords) => {
-        try {
-            return workRecords.map((wr) => {
-                const invoiceId = wr.custrecord_giv_liq_work_source_invoice || wr.sourceInvoiceId || '';
-                const itemId = wr.custrecord_giv_liq_work_source_item || wr.sourceItemId || '';
-                const amount = parseFloat(wr.custrecord_giv_liq_work_amount_to_settle || wr.amountToSettle || 0);
-
-                if (!invoiceId || !itemId) return wr;
-
-                const taxInfo = getTaxScheduleFromSourceInvoice(invoiceId, itemId);
-
-                return {
-                    ...wr,
-                    taxScheduleId: taxInfo.taxScheduleId,
-                    taxScheduleText: taxInfo.taxScheduleText,
-                    taxRate: taxInfo.taxRate,
-                    taxBasis: amount
-                };
-            });
-
-        } catch (e) {
-            log.error({
-                title: `${MODULE}.enrichWithTaxInfo`,
-                details: `[workRecords=${workRecords.length}] ${e.message || e}`
-            });
-            return workRecords;
         }
     };
 

@@ -107,17 +107,42 @@ define(['N/record', 'N/search', 'N/log', 'N/runtime'], (record, search, log, run
                 if (location) cmRec.setCurrentSublistValue({ sublistId: 'item', fieldId: 'location', value: parseInt(location, 10) || location });
                 cmRec.commitLine({ sublistId: 'item' });
 
-                // Tax Details Override
+                // Tax Details Override — inyectar impuestos reales del item origen
                 if (taxDetailsLines && taxDetailsLines.length > 0) {
+                    // Leer el taxDetailsReference asignado automáticamente a la línea del item
+                    const itemLineIdx = cmRec.getLineCount({ sublistId: 'item' }) - 1;
+                    const lineRef = cmRec.getSublistValue({ sublistId: 'item', fieldId: 'taxdetailsreference', line: itemLineIdx });
+
+                    log.debug({
+                        title: `${MODULE}.createCreditMemo`,
+                        details: `Item line ${itemLineIdx} taxdetailsreference = "${lineRef}"`
+                    });
+
                     cmRec.setValue({ fieldId: 'taxdetailsoverride', value: true });
 
+                    // Limpiar líneas de impuesto auto-calculadas por NetSuite
+                    let existingTaxLines = cmRec.getLineCount({ sublistId: 'taxdetails' });
+                    for (let t = existingTaxLines - 1; t >= 0; t--) {
+                        cmRec.removeLine({ sublistId: 'taxdetails', line: t });
+                    }
+
+                    // Insertar las líneas de impuesto correctas desde la factura origen
                     taxDetailsLines.forEach((taxLine) => {
                         cmRec.selectNewLine({ sublistId: 'taxdetails' });
+                        if (taxLine.taxType) {
+                            cmRec.setCurrentSublistValue({ sublistId: 'taxdetails', fieldId: 'taxtype', value: taxLine.taxType });
+                        }
                         cmRec.setCurrentSublistValue({ sublistId: 'taxdetails', fieldId: 'taxcode', value: taxLine.taxCodeId });
+                        cmRec.setCurrentSublistValue({ sublistId: 'taxdetails', fieldId: 'taxrate', value: taxLine.taxRate });
                         cmRec.setCurrentSublistValue({ sublistId: 'taxdetails', fieldId: 'taxbasis', value: taxLine.taxBasis });
                         cmRec.setCurrentSublistValue({ sublistId: 'taxdetails', fieldId: 'taxamount', value: taxLine.taxAmount });
-                        cmRec.setCurrentSublistValue({ sublistId: 'taxdetails', fieldId: 'linenumber', value: 1 });
+                        cmRec.setCurrentSublistValue({ sublistId: 'taxdetails', fieldId: 'taxdetailsreference', value: lineRef || '' });
                         cmRec.commitLine({ sublistId: 'taxdetails' });
+                    });
+
+                    log.audit({
+                        title: `${MODULE}.createCreditMemo`,
+                        details: `Tax Override: ${taxDetailsLines.length} lines injected: ${JSON.stringify(taxDetailsLines)}`
                     });
                 }
             } else {
@@ -142,7 +167,7 @@ define(['N/record', 'N/search', 'N/log', 'N/runtime'], (record, search, log, run
             // La localización AT Mexico requiere que los impuestos estén calculados
             // ANTES de poder asignar montos en el sublist 'apply'. El save() dispara
             // ese cálculo internamente (equivalente al botón "Preview Tax" en la UI).
-            const creditMemoId = cmRec.save({ enableSourcing: true, ignoreMandatoryFields: false });
+            const creditMemoId = cmRec.save({ enableSourcing: true, ignoreMandatoryFields: true });
 
             log.audit({
                 title: `${MODULE}.createCreditMemo`,
@@ -182,7 +207,7 @@ define(['N/record', 'N/search', 'N/log', 'N/runtime'], (record, search, log, run
                             }
                         }
 
-                        cmToApply.save({ enableSourcing: true, ignoreMandatoryFields: false });
+                        cmToApply.save({ enableSourcing: true, ignoreMandatoryFields: true });
 
                         log.audit({
                             title:   `${MODULE}.createCreditMemo`,
