@@ -98,7 +98,7 @@ define([
             scenarioField.addSelectOption({ value: '', text: '' });
             scenarioField.addSelectOption({ value: 'Estándar', text: LBL.SCENARIO_STANDARD });
             scenarioField.addSelectOption({ value: 'Consolidada', text: LBL.SCENARIO_CONSOLIDATED });
-            scenarioField.addSelectOption({ value: 'Específica', text: LBL.SCENARIO_SPECIFIC });
+            scenarioField.addSelectOption({ value: 'Específica (por SKU)', text: LBL.SCENARIO_SPECIFIC });
             scenarioField.addSelectOption({ value: 'Cobro en exceso', text: LBL.SCENARIO_EXCESS });
             scenarioField.addSelectOption({ value: 'Agrupación', text: LBL.SCENARIO_GROUPED });
             scenarioField.isMandatory = true;
@@ -587,37 +587,64 @@ define([
                 workIds.push(workId);
             });
 
-            // Consolidada / Agrupación / Cobro en exceso + Credit Memo:
-            // crear UN registro de aplicación por factura destino (M total).
-            // El reduce los agrupa todos bajo la misma key de acuerdo y los procesa juntos.
-            // NO aplica a Estándar (ya lleva el destino embebido en el registro fuente).
+            // Consolidada / Agrupación / Cobro en exceso / Específica (por SKU) + Credit Memo:
+            // crear UN registro de aplicación POR ACUERDO POR factura destino, con el applyAmount
+            // proporcional al monto que cada acuerdo aporta al total.
+            //
+            // PROBLEMA ANTERIOR: se creaba un solo WORK de destino con agreementId = firstSrc y
+            // applyAmount = total. Esto causaba que:
+            //   - Solo el acuerdo del firstSrc recibía el WORK de destino → su CM se aplicaba con monto incorrecto.
+            //   - Los demás acuerdos generaban CMs sin ninguna aplicación.
+            //
+            // FIX: agrupar sources por acuerdo, calcular proporción y crear un destination WORK por cada par
+            // (acuerdo × factura destino) con applyAmount proporcional.
             if (settlementMethod === '3' && destLines.length > 0 && !isEstandardCM) {
-                const firstSrc = sourceLines[0];
+
+                // 1. Agrupar source lines por acuerdo y sumar su amountToSettle
+                const agreementAmountMap = {};
+                sourceLines.forEach(src => {
+                    const agId = src.agreementId;
+                    agreementAmountMap[agId] = (agreementAmountMap[agId] || 0) + (parseFloat(src.amountToSettle) || 0);
+                });
+
+                const grandTotal = Object.values(agreementAmountMap).reduce((sum, v) => sum + v, 0);
+                const agreementEntries = Object.entries(agreementAmountMap);  // [[agId, amount], ...]
+
+                // 2. Por cada factura destino, crear un WORK de destino por acuerdo
                 destLines.forEach((dst) => {
-                    const dstWorkData = {
-                        customerId:       customerId,
-                        agreementId:      firstSrc.agreementId,
-                        settlementMethod: settlementMethod,
-                        scenario:         scenario,
-                        // Campos de fuente vacíos — este registro solo define la aplicación
-                        sourceInvoiceId:  '',
-                        sourceAccrualId:  '',
-                        sourceItemId:     '',
-                        originalAmount:   '0',
-                        returnsAmount:    '0',
-                        settledAmount:    '0',
-                        availableAmount:  '0',
-                        amountToSettle:   '0',   // ← no genera línea en el CM
-                        taxCodeId:        '',
-                        taxBasis:         '0',
-                        excessFlag:       false,
-                        invoiceTo:    dst.invoiceId   || '',
-                        applyAmount:  dst.applyAmount || ''
-                    };
-                    const workId = txnBuilder.createWorkRecord(dstWorkData, 'Suitelet', { ignoreMandatoryFields: true });
-                    workIds.push(workId);
+                    const dstApply = parseFloat(dst.applyAmount) || 0;
+
+                    agreementEntries.forEach(([agId, agAmount]) => {
+                        // Proporción de este acuerdo sobre el total
+                        const proportion = grandTotal > 0 ? agAmount / grandTotal : 1 / agreementEntries.length;
+                        const proportionalApply = Math.round(dstApply * proportion * 100) / 100;
+
+                        const dstWorkData = {
+                            customerId:       customerId,
+                            agreementId:      agId,
+                            settlementMethod: settlementMethod,
+                            scenario:         scenario,
+                            // Campos de fuente vacíos — este registro solo define la aplicación
+                            sourceInvoiceId:  '',
+                            sourceAccrualId:  '',
+                            sourceItemId:     '',
+                            originalAmount:   '0',
+                            returnsAmount:    '0',
+                            settledAmount:    '0',
+                            availableAmount:  '0',
+                            amountToSettle:   '0',   // ← no genera línea en el CM
+                            taxCodeId:        '',
+                            taxBasis:         '0',
+                            excessFlag:       false,
+                            invoiceTo:    dst.invoiceId || '',
+                            applyAmount:  String(proportionalApply)
+                        };
+                        const workId = txnBuilder.createWorkRecord(dstWorkData, 'Suitelet', { ignoreMandatoryFields: true });
+                        workIds.push(workId);
+                    });
                 });
             }
+
 
 
             // Disparar Map/Reduce
@@ -633,13 +660,13 @@ define([
                 details: `Created ${workIds.length} WORK records. M/R task: ${mrTaskId}`
             });
 
-            // Redirect a pantalla de estado
+            // Redirect a pantalla de estado — pasar IDs exactos de los WORKs creados
             redirect.toSuitelet({
                 scriptId: 'customscript_giv_sl_rebate_status',
                 deploymentId: 'customdeploy_giv_sl_status',
                 parameters: {
                     custpage_mr_task_id: mrTaskId,
-                    custpage_work_count: workIds.length
+                    custpage_work_ids:   workIds.join(',')
                 }
             });
 

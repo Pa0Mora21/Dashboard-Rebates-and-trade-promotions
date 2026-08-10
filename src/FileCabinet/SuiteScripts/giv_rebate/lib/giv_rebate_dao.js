@@ -58,12 +58,33 @@ define(['N/search', 'N/query', 'N/record', 'N/log'], (search, query, record, log
     rtd.custrecord_rm_accrual_amo                     AS accrual_detail_amount,
     rtd.custrecord_rm_td_item_qty                     AS quantity,
 
-    /* Liquidado: solo se considera liquidado cuando existe Claim.
-   Si existe custrecord_rm_rtd_claim toma achieved_rebate_amount.
-   Si no existe Claim, no hay liquidación generada. */
+    /* Liquidado — lógica inteligente que combina liquidación nativa RM y WORKs GIV:
+       CASO A — Existen WORKs GIV + claim nativo, y la suma NO excede la provisión:
+                 → ambas son cobros independientes reales (ej. CM90 nativa + WORK GIV).
+                 → settled = giv_completed + achieved_rebate_amount.
+       CASO B — Existen WORKs GIV, pero la suma con el claim excedería la provisión:
+                 → el claim fue generado por GIV (artefacto RM Bundle), no un cobro previo real.
+                 → settled = giv_completed únicamente.
+       CASO C — Solo existe claim nativo, sin WORKs GIV:
+                 → settled = achieved_rebate_amount (proxy del cobro nativo).
+       CASO D — Sin claim ni WORKs: settled = 0.
+       NOTA: Se usa LEFT JOIN (giv_completed) en lugar de sub-query correlacionada en CASE
+       porque SuiteQL NO soporta CASE WHEN (SELECT ...) cuando se combina con filtros específicos
+       como sourceInvoiceIds + itemId. El LEFT JOIN agrupado es equivalente y totalmente compatible. */
         CASE
+            /* CASO A: GIV + nativo independiente (suma ≤ provisión) */
+            WHEN giv_completed.total_completed IS NOT NULL
+                 AND rtd.custrecord_rm_rtd_claim IS NOT NULL
+                 AND (giv_completed.total_completed + COALESCE(rtd.custrecord_rm_achieved_rebate_amount, 0))
+                     <= ABS(rtd.custrecord_rm_accrual_amo)
+            THEN giv_completed.total_completed + COALESCE(rtd.custrecord_rm_achieved_rebate_amount, 0)
+            /* CASO B: GIV existe (con o sin claim excedente — usar solo GIV) */
+            WHEN giv_completed.total_completed IS NOT NULL
+            THEN giv_completed.total_completed
+            /* CASO C: Solo claim nativo sin GIV */
             WHEN rtd.custrecord_rm_rtd_claim IS NOT NULL
             THEN COALESCE(rtd.custrecord_rm_achieved_rebate_amount, 0)
+            /* CASO D: Sin liquidación */
             ELSE 0
         END AS settled_amount,
 
@@ -112,20 +133,16 @@ COALESCE(
 0
 ) AS returns_amount,
 
-    /* Bloqueado (en proceso activo: aún no se ha generado la transacción) */
-    COALESCE(
-        (
-            SELECT SUM(ABS(w.custrecord_giv_lw_amt_to_settle))
-            FROM customrecord_giv_rebate_liq_work w
-            WHERE w.custrecord_giv_lw_source_accrual = a.id
-              AND w.custrecord_giv_lw_proc_status IN
-                  ('Capturado','Validado','Procesando')
-              AND w.isinactive = 'F'
-        ),
-        0
-    ) AS locked_amount,
+    /* Bloqueado (en proceso activo: aún no se ha generado la transacción)
+       NOTA: Se usa LEFT JOIN (giv_locked) en lugar de sub-query correlacionada por la misma
+       razón que settled_amount: SuiteQL no soporta sub-queries correlacionadas en SELECT
+       cuando el outer query tiene filtros específicos (sourceInvoiceIds + itemId). */
+    COALESCE(giv_locked.total_locked, 0) AS locked_amount,
 
-    /* Liquidado por GIV (WORK records Completados — CM/VB ya generados por nuestro sistema) */
+    /* [COMENTADO] Liquidado por GIV (WORK records Completados).
+       Se comenta porque GIV genera una liquidación nativa al completar,
+       por lo que ya queda capturado en settled_amount (Claim nativo).
+       Sumarlo aquí causaba doble conteo.
     COALESCE(
         (
             SELECT SUM(ABS(wc.custrecord_giv_lw_amt_to_settle))
@@ -136,6 +153,7 @@ COALESCE(
         ),
         0
     ) AS giv_settled_amount
+    */
 
 FROM customrecord_rm_transaction_details rtd
 
@@ -151,6 +169,29 @@ LEFT JOIN transaction t
 
 LEFT JOIN item itm
     ON itm.id = rtd.custrecord_rm_rebate_item
+
+/* GIV WORKs Completados — agrupados por accrual para reemplazar sub-query correlacionada en CASE.
+   SuiteQL no soporta CASE WHEN (SELECT COUNT(*)...) cuando se combina con filtros específicos. */
+LEFT JOIN (
+    SELECT
+        wc.custrecord_giv_lw_source_accrual          AS accrual_id,
+        SUM(ABS(wc.custrecord_giv_lw_amt_to_settle)) AS total_completed
+    FROM customrecord_giv_rebate_liq_work wc
+    WHERE wc.custrecord_giv_lw_proc_status = 'Completado'
+      AND wc.isinactive = 'F'
+    GROUP BY wc.custrecord_giv_lw_source_accrual
+) giv_completed ON giv_completed.accrual_id = a.id
+
+/* GIV WORKs en proceso (Capturado/Validado/Procesando) — agrupados por accrual. */
+LEFT JOIN (
+    SELECT
+        wl.custrecord_giv_lw_source_accrual          AS accrual_id,
+        SUM(ABS(wl.custrecord_giv_lw_amt_to_settle)) AS total_locked
+    FROM customrecord_giv_rebate_liq_work wl
+    WHERE wl.custrecord_giv_lw_proc_status IN ('Capturado','Validado','Procesando')
+      AND wl.isinactive = 'F'
+    GROUP BY wl.custrecord_giv_lw_source_accrual
+) giv_locked ON giv_locked.accrual_id = a.id
 
 WHERE rtd.isinactive = 'F'
 
@@ -213,14 +254,36 @@ WHERE rtd.isinactive = 'F'
             log.debug({ title: `${MODULE}.getAvailableAccruals`, details: `Processing ${mappedResults.length} rows. First row: ${JSON.stringify(mappedResults[0])}` });
 
             mappedResults.forEach((row) => {
-                const accrualAmount    = parseFloat(row.accrual_detail_amount) || 0;
-                const settledAmount    = parseFloat(row.settled_amount)        || 0;  // Claim del SuiteApp
-                const returnsAmount    = parseFloat(row.returns_amount)        || 0;
-                const lockedAmount     = parseFloat(row.locked_amount)         || 0;
-                const givSettledAmount = parseFloat(row.giv_settled_amount)    || 0;  // WORK Completados GIV
+                // accrual_detail_amount  = monto del RTD de la factura origen (custrecord_rm_accrual_amo).
+                //                         Es el valor visible en la factura → base de "Original Provision".
+                // achieved_rebate_amount = monto liquidable calculado por el RM Bundle.
+                //                         Puede ser menor que accrual_amo cuando no se cumplen
+                //                         todos los umbrales del acuerdo.
+                const accrualDetailAmount = parseFloat(row.accrual_detail_amount)  || 0;
+                const achievedAmount      = parseFloat(row.achieved_rebate_amount) || 0;
 
-                // Saldo disponible = Provisión − Liquidado SuiteApp − Liquidado GIV − Devoluciones
-                const available = accrualAmount - settledAmount - givSettledAmount - returnsAmount;
+                // [FIX] Usar accrual_amo (lo que muestra la factura) como base de la provisión original.
+                // Antes se usaba achieved_rebate_amount, lo que causaba mostrar la mitad del valor real
+                // cuando achieved < accrual_amo (ej. INV123: accrual=$2.40, achieved=$1.20 → mostraba $1.20).
+                const accrualAmount = accrualDetailAmount > 0 ? accrualDetailAmount : achievedAmount;
+
+                const settledAmount = parseFloat(row.settled_amount) || 0;
+                const lockedAmount  = parseFloat(row.locked_amount)  || 0;
+
+                // [FIX] El RM Bundle ya calcula el accrual de la NC de forma proporcional:
+                //   devolver 1 de 2 unidades → RTD de la CM con accrual_amo = $1.20 (exacto).
+                // Aplicar achievedRatio encima de ese valor causaba doble reducción:
+                //   $1.20 × 0.50 = $0.60 en lugar de $1.20.
+                // Se usa returnsRaw directamente sin escalar.
+                //
+                // Escenario correcto post-fix:
+                //   INV123 (2 uds): accrual_amo=$2.40  → Original Provision = $2.40
+                //   CM     (1 ud):  return_raw =$1.20  → Returns            = $1.20
+                //   available = $2.40 − $0 − $1.20 = $1.20 ✓
+                const returnsAmount = parseFloat(row.returns_amount) || 0;
+
+                // Saldo disponible = Provisión original − Liquidado − Devoluciones
+                const available = accrualAmount - settledAmount - returnsAmount;
 
                 // Solo mostrar provisiones con saldo disponible mayor a 0.
                 // available = 0  → ya liquidado totalmente → excluir de la lista.
@@ -231,8 +294,8 @@ WHERE rtd.isinactive = 'F'
                         agreementId:      String(row.agreement_id),
                         agreementText:    row.agreement_name   || '',
                         accrualAmount:    accrualAmount,
-                        settledAmount:    settledAmount,        // Claim nativo SuiteApp
-                        givSettledAmount: givSettledAmount,     // WORK GIV Completados
+                        settledAmount:    settledAmount,        // Claim nativo SuiteApp (incluye liquidaciones GIV)
+                        // givSettledAmount: givSettledAmount,  // [COMENTADO] doble conteo
                         returnsAmount:    returnsAmount,
                         accrualDate:      row.accrual_date     || '',
                         invoiceNumber:    row.invoice_number   || 'N/A',
@@ -249,6 +312,7 @@ WHERE rtd.isinactive = 'F'
 
                 }
             });
+
 
             log.debug({ title: `${MODULE}.getAvailableAccruals`, details: `${results.length} provisiones disponibles` });
             return results;
@@ -614,7 +678,32 @@ WHERE rtd.isinactive = 'F'
             `;
 
             const results = query.runSuiteQL({ query: sql, params: [agreementId] }).asMappedResults();
-            return results.length > 0 ? results[0] : null;
+            if (results.length === 0) return null;
+
+            // Retorna AMBOS formatos para compatibilidad con todos los callers:
+            //   - camelCase: nuevo estándar (giv_sl_rebate_csv_upload.js usa settlementMethod)
+            //   - snake_case: callers existentes (giv_sl_rebate_dashboard.js y giv_mr_rebate_liquidation.js
+            //                 usan settlement_method y accounting_item)
+            const r = results[0];
+            return {
+                // ── camelCase (estándar nuevo) ──
+                id:               String(r.id),
+                name:             r.name                 || '',
+                settlementMethod: String(r.settlement_method || ''),
+                payerId:          String(r.payer_id       || ''),
+                accountingItem:   String(r.accounting_item || ''),
+                subsidiaryId:     String(r.subsidiary_id  || ''),
+                status:           r.status               || '',
+                creditAccount:    String(r.credit_account || ''),
+                debitAccount:     String(r.debit_account  || ''),
+                // ── snake_case (backward-compat para Dashboard y M/R) ──
+                settlement_method: String(r.settlement_method || ''),
+                payer_id:          String(r.payer_id       || ''),
+                accounting_item:   String(r.accounting_item || ''),
+                subsidiary_id:     String(r.subsidiary_id  || ''),
+                credit_account:    String(r.credit_account || ''),
+                debit_account:     String(r.debit_account  || '')
+            };
 
         } catch (e) {
             log.error({ title: `${MODULE}.getAgreement`, details: e.message || e });
@@ -689,6 +778,284 @@ WHERE rtd.isinactive = 'F'
         }
     };
 
+    /**
+     * Resuelve nombres/códigos → Internal IDs para la carga CSV en una sola pasada por tipo.
+     * Los valores puramente numéricos se mapean a sí mismos sin ninguna búsqueda en NS.
+     * Los valores texto se buscan por nombre/código en NetSuite (una búsqueda por tipo de entidad).
+     *
+     * @param {Object}   rawData
+     * @param {string[]} rawData.customerValues   Valores únicos de la columna Cliente
+     * @param {string[]} rawData.agreementValues  Valores únicos de la columna Agreement
+     * @param {string[]} rawData.invoiceValues    Valores únicos de Facturas (origen + destino combinados)
+     * @param {string[]} rawData.itemValues       Valores únicos de la columna Artículo
+     *
+     * @returns {{ customers: Object, agreements: Object, invoices: Object, items: Object }}
+     *   Mapas { "valorCSV": "internalId" } para cada tipo de entidad
+     */
+    const resolveCsvIdentifiers = (rawData) => {
+        const result = {
+            customers:      {},
+            agreements:     {},
+            invoices:       {},
+            invoiceCustomers: {},
+            invoiceLabels:  {},   // id → tranid (para links en errores)
+            items:          {},
+            itemLabels:     {},   // id → itemid (para links en errores)
+            agreementLabels:{},   // id → nombre acuerdo (para errores legibles)
+        };
+
+        /** Separa numéricos (ya son IDs) de texto (requieren búsqueda). */
+        const partition = (values) => {
+            const ids = [], names = [];
+            (values || []).forEach(v => {
+                const s = String(v || '').trim();
+                if (!s) return;
+                (/^[1-9]\d*$/.test(s) ? ids : names).push(s);
+            });
+            return { ids, names };
+        };
+
+        /** Numéricos: se mapean a sí mismos sin consulta a NS. */
+        const selfMap = (ids, map) => ids.forEach(id => { map[id] = id; });
+
+        /**
+         * Construye filtro NS: field IS v1 OR field IS v2 ...
+         * Retorna un array válido para search.create({ filters }).
+         */
+        const orFilter = (fieldId, values) => {
+            if (!values.length) return [];
+            if (values.length === 1) return [[fieldId, 'is', values[0]]];
+            const parts = [];
+            values.forEach((v, i) => {
+                if (i > 0) parts.push('OR');
+                parts.push([fieldId, 'is', v]);
+            });
+            return parts;
+        };
+
+        /**
+         * Construye filtro NS: (f1 IS v OR f2 IS v) OR (f1 IS v2 OR f2 IS v2) ...
+         * Para dos campos alternativos por valor.
+         */
+        const dualOrFilter = (field1, field2, values) => {
+            if (!values.length) return [];
+            if (values.length === 1) {
+                return [
+                    [field1, 'is', values[0]],
+                    'OR',
+                    [field2, 'is', values[0]]
+                ];
+            }
+            const groups = values.map(v => [
+                [field1, 'is', v],
+                'OR',
+                [field2, 'is', v]
+            ]);
+            const parts = [];
+            groups.forEach((g, i) => {
+                if (i > 0) parts.push('OR');
+                parts.push(g);
+            });
+            return parts;
+        };
+
+        // ── Clientes ─────────────────────────────────────────────────────────────
+        {
+            const { ids, names } = partition(rawData.customerValues);
+            selfMap(ids, result.customers);
+            if (names.length > 0) {
+                try {
+                    search.create({
+                        type: search.Type.CUSTOMER,
+                        filters: dualOrFilter('entityid', 'companyname', names),
+                        columns: [
+                            search.createColumn({ name: 'internalid' }),
+                            search.createColumn({ name: 'entityid' }),
+                            search.createColumn({ name: 'companyname' }),
+                            search.createColumn({ name: 'altname' })
+                        ]
+                    }).run().each(r => {
+                        const id  = r.getValue('internalid');
+                        const eid = (r.getValue('entityid')    || '').trim();
+                        const cn  = (r.getValue('companyname') || '').trim();
+                        const an  = (r.getValue('altname')     || '').trim();
+                        if (eid) result.customers[eid] = id;
+                        if (cn)  result.customers[cn]  = id;
+                        if (an)  result.customers[an]  = id;
+                        return true;
+                    });
+                } catch (e) {
+                    log.error({ title: `${MODULE}.resolveCsvIdentifiers.customers`, details: e.message || e });
+                }
+            }
+        }
+
+        // ── Acuerdos ────────────────────────────────────────────────────────────────────────
+        {
+            const { ids, names } = partition(rawData.agreementValues);
+            selfMap(ids, result.agreements);
+            if (names.length > 0) {
+                try {
+                    // NOTA: el tipo correcto del RM Bundle para acuerdos es customrecord_rm_sales_transaction.
+                    // Se busca por custrecord_agreement_names (campo personalizado) y también por
+                    // el nombre nativo del registro (name) para soportar ambas formas en el CSV.
+                    search.create({
+                        type: 'customrecord_rm_sales_transaction',
+                        filters: dualOrFilter('custrecord_agreement_names', 'name', names),
+                        columns: [
+                            search.createColumn({ name: 'internalid' }),
+                            search.createColumn({ name: 'name' }),
+                            search.createColumn({ name: 'custrecord_agreement_names' })
+                        ]
+                    }).run().each(r => {
+                        const id         = r.getValue('internalid');
+                        const recName    = (r.getValue('name')                       || '').trim();
+                        const agName     = (r.getValue('custrecord_agreement_names') || '').trim();
+                        // Registrar ambas variantes como clave válida en el CSV
+                        if (agName) {
+                            result.agreements[agName] = id;
+                            result.agreementLabels[String(id)] = agName;
+                        }
+                        if (recName && !result.agreements[recName]) {
+                            result.agreements[recName] = id;
+                            if (!result.agreementLabels[String(id)]) result.agreementLabels[String(id)] = recName;
+                        }
+                        return true;
+                    });
+                } catch (e) {
+                    log.error({ title: `${MODULE}.resolveCsvIdentifiers.agreements`, details: e.message || e });
+                }
+            }
+        }
+
+        // ── Facturas (origen + destino comparten el mismo mapa) ──────────────────
+        {
+            const { ids, names } = partition(rawData.invoiceValues);
+            selfMap(ids, result.invoices);
+            if (names.length > 0) {
+                try {
+                    // Construir filtro tranid OR para múltiples valores
+                    const tranFilters = [];
+                    names.forEach((n, i) => {
+                        if (i > 0) tranFilters.push('OR');
+                        tranFilters.push(['tranid', 'is', n]);
+                    });
+                    const invFilters = names.length === 1
+                        ? [['mainline', 'is', 'T'], 'AND', tranFilters[0]]
+                        : [['mainline', 'is', 'T'], 'AND', tranFilters];
+
+                    search.create({
+                        type: search.Type.INVOICE,
+                        filters: invFilters,
+                        columns: [
+                            search.createColumn({ name: 'internalid' }),
+                            search.createColumn({ name: 'tranid' })
+                        ]
+                    }).run().each(r => {
+                        const id     = r.getValue('internalid');
+                        const tranid = (r.getValue('tranid') || '').trim();
+                        if (tranid) result.invoices[tranid] = id;
+                        return true;
+                    });
+                } catch (e) {
+                    log.error({ title: `${MODULE}.resolveCsvIdentifiers.invoices`, details: e.message || e });
+                }
+            }
+        }
+
+        // ── Artículos ────────────────────────────────────────────────────────────
+        {
+            const { ids, names } = partition(rawData.itemValues);
+            selfMap(ids, result.items);
+            if (names.length > 0) {
+                try {
+                    search.create({
+                        type: search.Type.ITEM,
+                        filters: dualOrFilter('itemid', 'displayname', names),
+                        columns: [
+                            search.createColumn({ name: 'internalid' }),
+                            search.createColumn({ name: 'itemid' }),
+                            search.createColumn({ name: 'displayname' })
+                        ]
+                    }).run().each(r => {
+                        const id  = r.getValue('internalid');
+                        const iid = (r.getValue('itemid')      || '').trim();
+                        const dn  = (r.getValue('displayname') || '').trim();
+                        if (iid) result.items[iid] = id;
+                        if (dn)  result.items[dn]  = id;
+                        return true;
+                    });
+                } catch (e) {
+                    log.error({ title: `${MODULE}.resolveCsvIdentifiers.items`, details: e.message || e });
+                }
+            }
+        }
+
+        // ── Clientes de cada factura (para validar que Factura Destino pertenece al mismo cliente) ─
+        // Se hace después de resolver nombres porque necesitamos los Internal IDs finales.
+        const resolvedInvoiceIds = [...new Set(Object.values(result.invoices))];
+        if (resolvedInvoiceIds.length > 0) {
+            try {
+                const invIdFilters = resolvedInvoiceIds.length === 1
+                    ? [['internalid', 'anyof', resolvedInvoiceIds[0]], 'AND', ['mainline', 'is', 'T']]
+                    : [['internalid', 'anyof', resolvedInvoiceIds], 'AND', ['mainline', 'is', 'T']];
+
+                search.create({
+                    type: search.Type.INVOICE,
+                    filters: invIdFilters,
+                    columns: [
+                        search.createColumn({ name: 'internalid' }),
+                        search.createColumn({ name: 'entity' }),
+                        search.createColumn({ name: 'tranid' })  // para invoiceLabels
+                    ]
+                }).run().each(r => {
+                    const id     = r.getValue('internalid');
+                    const cust   = r.getValue('entity');
+                    const tranid = (r.getValue('tranid') || '').trim();
+                    if (id && cust)   result.invoiceCustomers[String(id)] = String(cust);
+                    if (id && tranid) result.invoiceLabels[String(id)]    = tranid;
+                    return true;
+                });
+            } catch (e) {
+                log.error({ title: `${MODULE}.resolveCsvIdentifiers.invoiceCustomers`, details: e.message || e });
+            }
+        }
+
+        // ── itemLabels: id → itemid (para mensajes de error con link clickeable) ──
+        // Usa orFilter (IS + OR) porque 'anyof' no está soportado en internalid para items en NS.
+        const resolvedItemIds = [...new Set(Object.values(result.items))];
+        if (resolvedItemIds.length > 0) {
+            try {
+                search.create({
+                    type: search.Type.ITEM,
+                    filters: orFilter('internalid', resolvedItemIds),
+                    columns: [
+                        search.createColumn({ name: 'internalid' }),
+                        search.createColumn({ name: 'itemid' })
+                    ]
+                }).run().each(r => {
+                    const id  = r.getValue('internalid');
+                    const iid = (r.getValue('itemid') || '').trim();
+                    if (id && iid) result.itemLabels[String(id)] = iid;
+                    return true;
+                });
+            } catch (e) {
+                log.error({ title: `${MODULE}.resolveCsvIdentifiers.itemLabels`, details: e.message || e });
+            }
+        }
+
+        log.debug({
+            title:   `${MODULE}.resolveCsvIdentifiers`,
+            details: `Resuelto — customers: ${Object.keys(result.customers).length}, ` +
+                     `agreements: ${Object.keys(result.agreements).length}, ` +
+                     `invoices: ${Object.keys(result.invoices).length}, ` +
+                     `invoiceCustomers: ${Object.keys(result.invoiceCustomers).length}, ` +
+                     `items: ${Object.keys(result.items).length}`
+        });
+
+        return result;
+    };
+
     return {
         getAvailableAccruals,
         getTransactionsByAgreement,
@@ -701,6 +1068,7 @@ WHERE rtd.isinactive = 'F'
         getTaxInfoFromInvoiceLine,
         getAgreement,
         getAgreementDetails: getAgreement,
-        getPendingWorkRecords
+        getPendingWorkRecords,
+        resolveCsvIdentifiers
     };
 });

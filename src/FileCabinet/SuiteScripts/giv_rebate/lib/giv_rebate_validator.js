@@ -119,7 +119,7 @@ define(['N/log', './giv_rebate_dao'], (log, dao) => {
                 }
                 break;
 
-            case 'Específica':
+            case 'Específica (por SKU)':
                 break;
 
             case 'Cobro en exceso':
@@ -142,16 +142,23 @@ define(['N/log', './giv_rebate_dao'], (log, dao) => {
     /**
      * Valida una fila de archivo CSV.
      */
-    const validateCsvRow = (rowData, rowIndex) => {
+    const validateCsvRow = (rowData, rowIndex, labels = {}) => {
         const errors = [];
         const prefix = `Fila ${rowIndex + 1}:`;
 
         if (!rowData.externalId) errors.push(`${prefix} External ID es obligatorio.`);
         if (!rowData.customerId) errors.push(`${prefix} Cliente es obligatorio.`);
         if (!rowData.agreementId) errors.push(`${prefix} Acuerdo de reembolso es obligatorio.`);
-        if (!rowData.scenario) errors.push(`${prefix} Tipo de liquidación es obligatorio.`);
         if (!rowData.sourceInvoiceId) errors.push(`${prefix} Factura origen es obligatorio.`);
         if (!rowData.itemId) errors.push(`${prefix} Artículo es obligatorio.`);
+
+        // Validar que el escenario sea uno de los valores permitidos por el DRD
+        const VALID_SCENARIOS = ['Estándar', 'Consolidada', 'Específica (por SKU)', 'Cobro en exceso', 'Agrupación'];
+        if (!rowData.scenario) {
+            errors.push(`${prefix} Tipo de liquidación es obligatorio.`);
+        } else if (!VALID_SCENARIOS.includes(rowData.scenario)) {
+            errors.push(`${prefix} Tipo de liquidación "${rowData.scenario}" no es válido. Valores aceptados: ${VALID_SCENARIOS.join(', ')}.`);
+        }
 
         const amount = parseFloat(rowData.amountToSettle);
         if (isNaN(amount) || amount <= 0) {
@@ -167,6 +174,20 @@ define(['N/log', './giv_rebate_dao'], (log, dao) => {
             const applyAmount = parseFloat(rowData.applyAmount);
             if (isNaN(applyAmount) || applyAmount <= 0) {
                 errors.push(`${prefix} Monto a aplicar debe ser mayor a cero.`);
+            }
+        }
+
+        // Validar que la Factura Destino pertenezca al mismo cliente de la fila
+        // invoiceToCustomerId es poblado por el suitelet desde idMaps.invoiceCustomers
+        // labels.invoiceTo puede ser un <a> HTML con link clickeable (viene del suitelet).
+        if (rowData.invoiceTo && rowData.invoiceToCustomerId && rowData.customerId) {
+            if (String(rowData.invoiceToCustomerId) !== String(rowData.customerId)) {
+                const invoiceDisplay = labels.invoiceTo || `ID ${rowData.invoiceTo}`;
+                errors.push(
+                    `${prefix} La Factura Destino (${invoiceDisplay}) pertenece al cliente ` +
+                    `${rowData.invoiceToCustomerId}, pero la fila indica el cliente ${rowData.customerId}. ` +
+                    `Verifique que la factura destino corresponda al mismo cliente.`
+                );
             }
         }
 

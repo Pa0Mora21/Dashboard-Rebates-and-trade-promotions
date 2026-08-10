@@ -17,11 +17,12 @@ define([
     'N/search',
     'N/runtime',
     'N/log',
+    'N/query',
     '../lib/giv_rebate_dao',
     '../lib/giv_rebate_validator',
     '../lib/giv_rebate_tax_utils',
     '../lib/giv_rebate_transaction_builder'
-], (record, search, runtime, log, dao, validator, taxUtils, txnBuilder) => {
+], (record, search, runtime, log, nsQuery, dao, validator, taxUtils, txnBuilder) => {
 
     const MODULE = 'giv_mr_rebate_liquidation';
 
@@ -29,13 +30,26 @@ define([
      * getInputData — Busca registros WORK con estado "Capturado".
      */
     const getInputData = () => {
-        log.audit({ title: `${MODULE}.getInputData`, details: 'Starting liquidation M/R' });
+        // FIX 5: leer el parámetro de lote CSV (si el M/R fue disparado desde giv_sl_rebate_csv_upload).
+        // Si está presente, filtrar solo los WORK de ese lote para evitar mezclar
+        // WORKs manuales concurrentes con WORKs de CSV en el mismo ciclo.
+        const csvBatchId = runtime.getCurrentScript().getParameter({ name: 'custscript_giv_mr_csv_batch_id' }) || '';
+
+        log.audit({
+            title:   `${MODULE}.getInputData`,
+            details: `Starting liquidation M/R${csvBatchId ? ` | CSV Batch: ${csvBatchId}` : ' | Suitelet manual (todos los Capturado)'}`
+        });
+
+        const filters = [['custrecord_giv_lw_proc_status', 'is', 'Capturado']];
+
+        if (csvBatchId) {
+            // Solo procesar el lote CSV específico
+            filters.push('AND', ['custrecord_giv_lw_csv_batch_id', 'is', csvBatchId]);
+        }
 
         return search.create({
             type: 'customrecord_giv_rebate_liq_work',
-            filters: [
-                ['custrecord_giv_lw_proc_status', 'is', 'Capturado']
-            ],
+            filters: filters,
             columns: [
                 search.createColumn({ name: 'internalid' }),
                 search.createColumn({ name: 'custrecord_giv_lw_customer' }),
@@ -152,33 +166,57 @@ define([
             // Obtener detalles del acuerdo
             const agreement = dao.getAgreement(agreementId);
 
-            // ── Location: heredar de la factura origen (primer registro que tenga sourceInvoiceId) ──
-            // IMPORTANTE: no usar siempre firstRecord — en Consolidada puede ser un registro
-            // de destino (sourceInvoiceId vacío). Se busca el primer registro con sourceInvoiceId real.
-            let locationId = '';
-            const firstSourceRecord = workRecords.find(wr => wr.sourceInvoiceId) || null;
-            if (firstSourceRecord) {
-                try {
-                    const invFields = search.lookupFields({
-                        type:    search.Type.INVOICE,
-                        id:      firstSourceRecord.sourceInvoiceId,
-                        columns: ['location']
-                    });
-                    locationId = invFields.location?.[0]?.value || '';
-                } catch (le) {
-                    log.debug({ title: `${MODULE}.reduce.location`, details: `No se pudo leer location de invoice ${firstSourceRecord.sourceInvoiceId}: ${le.message}` });
-                }
-            }
+            // ── Location: DESHABILITADO ─────────────────────────────────────────────────
+            // La resolución de location (lookupFields → SuiteQL → Script Parameter) ya no
+            // es necesaria. El CM usa agreement.accounting_item (tipo OthCharge), que no
+            // requiere location a nivel de línea ni en el header del formulario 589.
+            // Se deja comentado como referencia por si en el futuro se usan otros ítems
+            // o formularios que sí requieran location.
+            //
+            // let locationId = '';
+            // const firstSourceRecord = workRecords.find(wr => wr.sourceInvoiceId) || null;
+            // if (firstSourceRecord) {
+            //     try {
+            //         const invFields = search.lookupFields({
+            //             type:    search.Type.INVOICE,
+            //             id:      firstSourceRecord.sourceInvoiceId,
+            //             columns: ['location']
+            //         });
+            //         locationId = invFields.location?.[0]?.value || '';
+            //     } catch (le) {
+            //         log.debug({ title: `${MODULE}.reduce.location`, details: `No se pudo leer location de invoice ${firstSourceRecord.sourceInvoiceId}: ${le.message}` });
+            //     }
+            //
+            //     // Fallback SuiteQL: en cuentas AT México la location está en las líneas, no en el header.
+            //     if (!locationId) {
+            //         try {
+            //             const sqlResult = nsQuery.runSuiteQL({
+            //                 query: `SELECT TOP 1 tl.location FROM transactionLine tl WHERE tl.transaction = ${firstSourceRecord.sourceInvoiceId} AND tl.mainline = 'F' AND tl.location IS NOT NULL`
+            //             });
+            //             if (sqlResult.results.length > 0) {
+            //                 const locValue = sqlResult.results[0].values[0];
+            //                 if (locValue) {
+            //                     locationId = String(locValue);
+            //                     log.audit({ title: `${MODULE}.reduce.location`, details: `Location leída vía SuiteQL de líneas de factura ${firstSourceRecord.sourceInvoiceId}: ${locationId}` });
+            //                 }
+            //             }
+            //         } catch (sqlErr) {
+            //             log.error({ title: `${MODULE}.reduce.location`, details: `Error SuiteQL leyendo location de líneas de factura ${firstSourceRecord.sourceInvoiceId}: ${sqlErr.message}` });
+            //         }
+            //     }
+            // }
+            //
+            // // Fallback: Script Parameter "Default Location"
+            // if (!locationId) {
+            //     locationId = runtime.getCurrentScript().getParameter({ name: 'custscript_giv_mr_default_location' }) || '';
+            //     if (locationId) {
+            //         log.debug({ title: `${MODULE}.reduce.location`, details: `Usando Default Location del Script Parameter: ${locationId}` });
+            //     } else {
+            //         log.audit({ title: `${MODULE}.reduce.location`, details: 'ADVERTENCIA: No se encontró Location en la factura origen ni en el Script Parameter. Si Location es obligatoria, el CM/VB fallará.' });
+            //     }
+            // }
+            const locationId = '';   // no requerida con accounting_item (OthCharge) + form 589
 
-            // Fallback: Script Parameter "Default Location"
-            if (!locationId) {
-                locationId = runtime.getCurrentScript().getParameter({ name: 'custscript_giv_mr_default_location' }) || '';
-                if (locationId) {
-                    log.debug({ title: `${MODULE}.reduce.location`, details: `Usando Default Location del Script Parameter: ${locationId}` });
-                } else {
-                    log.audit({ title: `${MODULE}.reduce.location`, details: 'ADVERTENCIA: No se encontró Location en la factura origen ni en el Script Parameter. Si Location es obligatoria, el CM/VB fallará.' });
-                }
-            }
 
             let generatedTxnId = '';
             let transactionType = '';
@@ -245,14 +283,108 @@ define([
 
                 } else {
                     // Escenarios 1, 2, 3 — solo registros de fuente (amountToSettle > 0) al CM
-                    cmLines = workRecords
-                        .filter(wr => parseFloat(wr.amountToSettle) > 0)
-                        .map(wr => ({
-                            itemId: agreement.accounting_item,
-                            amount: parseFloat(wr.amountToSettle) || 0,
-                            taxCodeId: wr.taxCodeId,
-                            description: `Liquidación rebate - Acuerdo ${agreementId}`
+
+                    // Consolidada: descripción enriquecida con nombre de acuerdo + tranid de factura origen.
+                    // Se hace un lookup por lote de las facturas únicas para no multiplicar llamadas a la API.
+                    let invoiceTranIdMap = {};
+                    if (scenario === 'Consolidada') {
+                        const uniqueInvoiceIds = [...new Set(
+                            workRecords
+                                .filter(wr => parseFloat(wr.amountToSettle) > 0 && wr.sourceInvoiceId)
+                                .map(wr => wr.sourceInvoiceId)
+                        )];
+
+                        uniqueInvoiceIds.forEach(invId => {
+                            try {
+                                const fields = search.lookupFields({
+                                    type:    search.Type.INVOICE,
+                                    id:      invId,
+                                    columns: ['tranid']
+                                });
+                                invoiceTranIdMap[invId] = fields.tranid || invId;
+                            } catch (le) {
+                                log.error({
+                                    title:   `${MODULE}.reduce.invoiceLookup`,
+                                    details: `No se pudo obtener tranid de factura ${invId}: ${le.message || le}`
+                                });
+                                invoiceTranIdMap[invId] = invId; // fallback: usar el ID interno
+                            }
+                        });
+                    }
+
+                    const agreementName = agreement.name || `Acuerdo ${agreementId}`;
+
+                    if (scenario === 'Específica (por SKU)') {
+                        // Agrupar por sourceItemId: 1 línea en el CM por SKU único.
+                        // Si varias provisiones comparten el mismo artículo, sus montos se suman.
+                        const skuMap = {};
+                        workRecords
+                            .filter(wr => parseFloat(wr.amountToSettle) > 0)
+                            .forEach(wr => {
+                                const skuKey = wr.sourceItemId || '__sin_sku__';
+                                if (!skuMap[skuKey]) {
+                                    skuMap[skuKey] = {
+                                        sourceItemId: wr.sourceItemId,           // para lookup de nombre y descripción
+                                        itemId:       agreement.accounting_item,  // ítem contable del acuerdo (OthCharge)
+                                        amount:       0,
+                                        taxCodeId:    wr.taxCodeId               // taxCode del primer WORK del SKU
+                                    };
+                                }
+                                skuMap[skuKey].amount += parseFloat(wr.amountToSettle) || 0;
+                            });
+
+                        // Lookup por lote de los nombres de artículo (campo 'itemid' = código/nombre en NS)
+                        // Patrón idéntico al lookup de tranid en Consolidada — una llamada por SKU único.
+                        const skuNameMap = {};
+                        Object.values(skuMap).forEach(sku => {
+                            if (!sku.sourceItemId) return;
+                            try {
+                                const itemFields = search.lookupFields({
+                                    type:    search.Type.ITEM,
+                                    id:      sku.sourceItemId,
+                                    columns: ['itemid', 'displayname']
+                                });
+                                skuNameMap[sku.sourceItemId] = itemFields.displayname || itemFields.itemid || String(sku.sourceItemId);
+                            } catch (ile) {
+                                log.error({
+                                    title:   `${MODULE}.reduce.itemLookup`,
+                                    details: `No se pudo obtener nombre del artículo ${sku.sourceItemId}: ${ile.message || ile}`
+                                });
+                                skuNameMap[sku.sourceItemId] = String(sku.sourceItemId); // fallback: usar el ID
+                            }
+                        });
+
+                        cmLines = Object.values(skuMap).map(sku => ({
+                            itemId:      sku.itemId,                                                  // accounting_item del acuerdo
+                            amount:      Math.round(sku.amount * 100) / 100,
+                            taxCodeId:   sku.taxCodeId,
+                            description: `Liquidación rebate por SKU ${skuNameMap[sku.sourceItemId] || sku.sourceItemId || ''} - Acuerdo ${agreementId}`
                         }));
+
+                        log.debug({
+                            title:   `${MODULE}.reduce.skuGrouping`,
+                            details: `Escenario SKU: ${Object.keys(skuMap).length} SKUs únicos → ${cmLines.length} líneas en CM | Acuerdo ${agreementId}`
+                        });
+
+                    } else {
+                        cmLines = workRecords
+                            .filter(wr => parseFloat(wr.amountToSettle) > 0)
+                            .map(wr => {
+                                let description;
+                                if (scenario === 'Consolidada') {
+                                    const invoiceName = invoiceTranIdMap[wr.sourceInvoiceId] || wr.sourceInvoiceId;
+                                    description = `${agreementName} - ${invoiceName}`;
+                                } else {
+                                    description = `Liquidación rebate - Acuerdo ${agreementId}`;
+                                }
+                                return {
+                                    itemId:      agreement.accounting_item,
+                                    amount:      parseFloat(wr.amountToSettle) || 0,
+                                    taxCodeId:   wr.taxCodeId,
+                                    description: description
+                                };
+                            });
+                    }
                 }
 
                 // Preparar aplicación de facturas destino
@@ -272,13 +404,15 @@ define([
                 }));
 
                 generatedTxnId = txnBuilder.createCreditMemo({
-                    customerId:       customerId,
-                    lines:            cmLines,
+                    customerId:          customerId,
+                    lines:               cmLines,
                     invoiceApplications: invoiceApplications,
-                    scenario:         scenario,
-                    accountingItemId: accountingItemId,
-                    taxDetailsLines:  taxDetailsLines,
-                    location:         locationId
+                    scenario:            scenario,
+                    accountingItemId:    accountingItemId,
+                    taxDetailsLines:     taxDetailsLines,
+                    location:            locationId,
+                    formId:              589  // RM Credit Memo Disbursement (confirmado vía CM80 en Sandbox)
+                    // settlementHistoryId se añade en Fase posterior (post-Claim)
                 });
                 transactionType = 'Credit Memo';
 
@@ -353,9 +487,64 @@ define([
                 });
             });
 
+            // ── Crear el Claim nativo del RM SuiteApp (no-bloqueante) ──────────────
+            // Flujo en 4 fases:
+            //   Fase 1: marca custrecord_rm_td_rebateselected = true en RTDs
+            //   Fase 2: crea el Claim
+            //   Fase 3: vincula RTDs al Claim (custrecord_rm_rtd_claim)
+            //   Fase 4: crea JE de reversa del Accrual (el Bundle no lo hace vía SuiteScript)
+            const accrualIds = [...new Set(workRecords.map(wr => wr.sourceAccrualId).filter(Boolean))];
+
+            // Monto para el JE de reversa por accrual (Fase 4 del Claim).
+            // · Cobro en exceso: el JE revierte solo la provisión disponible (cap = availableAmount).
+            //   El CM va por el monto total (amountToSettle, que incluye el excedente).
+            //   Ej: provisión = 10, solicitado = 12 → JE revierte 10, CM va por 12. (DRD)
+            // · Resto de escenarios: usa amountToSettle completo.
+            const accrualAmounts = {};
+            workRecords.forEach(wr => {
+                const acId = wr.sourceAccrualId;
+                if (!acId) return;
+                const reverseAmount = scenario === 'Cobro en exceso'
+                    ? Math.min(parseFloat(wr.amountToSettle) || 0, parseFloat(wr.availableAmount) || 0)
+                    : (parseFloat(wr.amountToSettle) || 0);
+                accrualAmounts[acId] = (accrualAmounts[acId] || 0) + reverseAmount;
+            });
+
+            const claimId = txnBuilder.createNativeClaim({
+                agreementId:    agreementId,
+                customerId:     customerId,
+                totalAmount:    totalSettledInGroup,
+                transactionId:  generatedTxnId,
+                accrualIds:     accrualIds,
+                accrualAmounts: accrualAmounts
+            });
+
+            // ── Vincular Claim al Credit Memo (custbody_rm_tran_settlement_his_rel) ────────
+            // El campo se llena DESPUÉS de crear el Claim porque su ID no estaba
+            // disponible durante la creación del CM (FASE 3 retroactiva).
+            if (claimId && settlementMethod === '3') {
+                try {
+                    record.submitFields({
+                        type:   record.Type.CREDIT_MEMO,
+                        id:     generatedTxnId,
+                        values: { custbody_rm_tran_settlement_his_rel: parseInt(claimId, 10) }
+                    });
+
+                    log.audit({
+                        title:   `${MODULE}.reduce`,
+                        details: `Linked CM ${generatedTxnId} → Claim ${claimId} (custbody_rm_tran_settlement_his_rel)`
+                    });
+                } catch (linkErr) {
+                    log.error({
+                        title:   `${MODULE}.reduce.linkClaim`,
+                        details: `No se pudo vincular CM ${generatedTxnId} al Claim ${claimId}: ${linkErr.message || linkErr}`
+                    });
+                }
+            }
+
             log.audit({
-                title: `${MODULE}.reduce`,
-                details: `Group ${context.key}: Generated ${transactionType} ${generatedTxnId} for ${workRecords.length} WORK records`
+                title:   `${MODULE}.reduce`,
+                details: `Group ${context.key}: ${transactionType} ${generatedTxnId} | ${workRecords.length} WORKs | Accruals: [${accrualIds.join(', ')}] | Claim: ${claimId || 'N/A'}`
             });
 
         } catch (e) {
