@@ -655,6 +655,76 @@ WHERE rtd.isinactive = 'F'
     };
 
     /**
+     * Obtiene TODOS los detalles fiscales (taxdetails) de un artículo en una factura.
+     * En AT Mexico, un solo artículo puede tener múltiples impuestos (ej. IEPS 8% + IVA 0%).
+     * Esta función lee la sublista 'taxdetails' y filtra por el taxDetailsReference de la línea.
+     *
+     * @param {string} invoiceId  Internal ID de la factura
+     * @param {string} itemId     Internal ID del artículo
+     * @param {number} amount     Monto a liquidar (para calcular bases proporcionales)
+     * @returns {Array<{taxCodeId: string, taxRate: number, taxBasis: number, taxAmount: number, origNetAmount: number}>}
+     */
+    const getAllTaxDetailsFromInvoiceLine = (invoiceId, itemId, amount) => {
+        try {
+            if (!invoiceId || !itemId) return [];
+
+            const inv = record.load({ type: record.Type.INVOICE, id: invoiceId, isDynamic: false });
+
+            // 1. Encontrar la línea del item y su taxDetailsReference
+            let targetRef = '';
+            let lineNetAmount = 0;
+            const lineCount = inv.getLineCount({ sublistId: 'item' });
+
+            for (let i = 0; i < lineCount; i++) {
+                const lineItemId = inv.getSublistValue({ sublistId: 'item', fieldId: 'item', line: i });
+                if (String(lineItemId) === String(itemId)) {
+                    targetRef = inv.getSublistValue({ sublistId: 'item', fieldId: 'taxdetailsreference', line: i }) || '';
+                    lineNetAmount = Math.abs(parseFloat(inv.getSublistValue({ sublistId: 'item', fieldId: 'amount', line: i })) || 0);
+                    break;
+                }
+            }
+
+            if (!targetRef) {
+                log.debug({ title: `${MODULE}.getAllTaxDetailsFromInvoiceLine`, details: `No taxDetailsReference for item ${itemId} in invoice ${invoiceId}` });
+                return [];
+            }
+
+            // 2. Leer la sublista taxdetails y filtrar por el reference
+            const taxDetailCount = inv.getLineCount({ sublistId: 'taxdetails' });
+            const taxLines = [];
+
+            for (let j = 0; j < taxDetailCount; j++) {
+                const ref = inv.getSublistValue({ sublistId: 'taxdetails', fieldId: 'taxdetailsreference', line: j }) || '';
+                if (ref === targetRef) {
+                    const taxCodeId = String(inv.getSublistValue({ sublistId: 'taxdetails', fieldId: 'taxcode', line: j }) || '');
+                    const taxRate   = parseFloat(inv.getSublistValue({ sublistId: 'taxdetails', fieldId: 'taxrate', line: j })) || 0;
+                    const origBasis = parseFloat(inv.getSublistValue({ sublistId: 'taxdetails', fieldId: 'taxbasis', line: j })) || 0;
+                    const taxType   = String(inv.getSublistValue({ sublistId: 'taxdetails', fieldId: 'taxtype', line: j }) || '');
+
+                    // Calcular base proporcional: si liquidamos $1 de una línea de $200,
+                    // la base proporcional es (1/200) * origBasis
+                    const proportion = lineNetAmount > 0 ? (parseFloat(amount) || 0) / lineNetAmount : 0;
+                    const taxBasis  = Math.round(origBasis * proportion * 100) / 100;
+                    const taxAmount = Math.round(taxBasis * (taxRate / 100) * 100) / 100;
+
+                    taxLines.push({ taxCodeId, taxRate, taxBasis, taxAmount, taxType, origNetAmount: lineNetAmount });
+                }
+            }
+
+            log.debug({
+                title: `${MODULE}.getAllTaxDetailsFromInvoiceLine`,
+                details: `Invoice ${invoiceId} / Item ${itemId} / Ref ${targetRef} → ${taxLines.length} tax lines: ${JSON.stringify(taxLines)}`
+            });
+
+            return taxLines;
+
+        } catch (e) {
+            log.error({ title: `${MODULE}.getAllTaxDetailsFromInvoiceLine`, details: `[Inv=${invoiceId}, Item=${itemId}] ${e.message || e}` });
+            return [];
+        }
+    };
+
+    /**
      * Obtiene datos de un acuerdo de rebate por su Internal ID.
      *
      * @param {string} agreementId
@@ -1066,6 +1136,7 @@ WHERE rtd.isinactive = 'F'
         getLockedAccrualAmounts: getLockedAccrualAmount,
         getOpenInvoices,
         getTaxInfoFromInvoiceLine,
+        getAllTaxDetailsFromInvoiceLine,
         getAgreement,
         getAgreementDetails: getAgreement,
         getPendingWorkRecords,

@@ -238,16 +238,16 @@ define([
 
                     accountingItemId = agreement.accounting_item;
 
-                    const enriched = taxUtils.enrichWithTaxInfo(workRecords);
+                    // Solo registros de fuente (amountToSettle > 0) participan en el Tax Override
+                    const sourceWRs = workRecords.filter(wr => parseFloat(wr.amountToSettle) > 0);
+                    const enriched = taxUtils.enrichWithTaxInfo(sourceWRs);
                     taxDetailsLines = taxUtils.buildTaxDetailsOverride(enriched);
 
-                    // Solo registros de fuente (amountToSettle > 0) contribuyen al CM
-                    cmLines = workRecords
-                        .filter(wr => parseFloat(wr.amountToSettle) > 0)
-                        .map(wr => ({
-                            itemId: agreement.accounting_item,
-                            amount: parseFloat(wr.amountToSettle) || 0
-                        }));
+                    // Solo registros de fuente contribuyen al CM
+                    cmLines = sourceWRs.map(wr => ({
+                        itemId: agreement.accounting_item,
+                        amount: parseFloat(wr.amountToSettle) || 0
+                    }));
 
                 } else if (scenario === 'Cobro en exceso') {
                     // Escenario 4 — Prorrateo del excedente entre líneas de fuente
