@@ -63,7 +63,7 @@ define([
                 id: 'custpage_source_invoice',
                 type: serverWidget.FieldType.MULTISELECT,
                 label: LBL.SOURCE_INVOICE,
-                source: 'transaction',
+                source: 'invoice',
                 container: 'custpage_filter_group'
             });
 
@@ -216,7 +216,9 @@ define([
             const hasFilters = params.custpage_agreement
                 || params.custpage_customer
                 || params.custpage_source_invoice
-                || params.custpage_item;
+                || params.custpage_item
+                || params.custpage_date_from
+                || params.custpage_date_to;
 
             // ── Detectar método de liquidación del acuerdo seleccionado ──
             let settlementMethod = null;

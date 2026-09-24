@@ -231,12 +231,12 @@ WHERE rtd.isinactive = 'F'
             }
 
             if (filters.dateFrom) {
-                sql += ` AND a.custrecord_rm_accru_date >= TO_DATE(?, 'YYYY-MM-DD')`;
+                sql += ` AND a.custrecord_rm_accru_date >= ?`;
                 params.push(filters.dateFrom);
             }
 
             if (filters.dateTo) {
-                sql += ` AND a.custrecord_rm_accru_date <= TO_DATE(?, 'YYYY-MM-DD')`;
+                sql += ` AND a.custrecord_rm_accru_date <=?`;
                 params.push(filters.dateTo);
             }
 
