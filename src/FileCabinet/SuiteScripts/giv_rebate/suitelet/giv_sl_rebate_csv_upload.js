@@ -353,7 +353,7 @@ define([
                         batchAccrualUsage[sourceAccrualId] = (batchAccrualUsage[sourceAccrualId] || 0) + rowAmt;
                     }
 
-                    const taxInfo = dao.getTaxInfoFromInvoiceLine(rowData.sourceInvoiceId, rowData.itemId);
+                    const taxDetails = dao.getAllTaxDetailsFromInvoiceLine(rowData.sourceInvoiceId, rowData.itemId, parseFloat(rowData.amountToSettle || 0));
                     validRows.push({
                         rowIndex:         i,
                         rowData:          rowData,
@@ -361,7 +361,7 @@ define([
                         sourceAccrualId:  sourceAccrualId,
                         originalAmount:   originalAmount,
                         availableAmount:  availableAmount,
-                        taxInfo:          taxInfo
+                        taxDetails:       taxDetails
                     });
 
                 } catch (rowErr) {
@@ -388,7 +388,7 @@ define([
             let runtimeErrorCount = 0;
             const runtimeErrors  = [];
 
-            validRows.forEach(({ rowIndex, rowData, settlementMethod, sourceAccrualId, originalAmount, availableAmount, taxInfo }) => {
+            validRows.forEach(({ rowIndex, rowData, settlementMethod, sourceAccrualId, originalAmount, availableAmount, taxDetails }) => {
                 try {
                     txnBuilder.createWorkRecord({
                         customerId:       rowData.customerId,
@@ -403,8 +403,8 @@ define([
                         amountToSettle:   rowData.amountToSettle,
                         invoiceTo:        rowData.invoiceTo,
                         applyAmount:      rowData.applyAmount,
-                        taxCodeId:        taxInfo.taxCodeId,
                         taxBasis:         rowData.amountToSettle,
+                        taxDetails:       taxDetails,
                         excessFlag:       rowData.scenario === 'Cobro en exceso',
                         csvBatchId:       batchId
                     }, 'CSV');

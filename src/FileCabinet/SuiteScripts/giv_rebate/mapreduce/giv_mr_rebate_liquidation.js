@@ -91,6 +91,8 @@ define([
 
             const groupKey = `${agreementId}_${scenario}_${customerId}`;
 
+            const rawTaxCodeVal = values['custrecord_giv_lw_taxcode']?.value || values['custrecord_giv_lw_taxcode'] || '';
+
             const payload = {
                 workId: workId,
                 customerId: customerId,
@@ -105,8 +107,10 @@ define([
                 amountToSettle: values['custrecord_giv_lw_amt_to_settle'] || '0',
                 invoiceTo: values['custrecord_giv_lw_invoice_to']?.value || values['custrecord_giv_lw_invoice_to'] || '',
                 applyAmount: values['custrecord_giv_lw_apply_amount'] || '0',
-                taxCodeId: values['custrecord_giv_lw_taxcode']?.value || values['custrecord_giv_lw_taxcode'] || '',
+                taxCodeId: rawTaxCodeVal,
+                taxRate: 0,
                 taxBasis: values['custrecord_giv_lw_tax_basis'] || '0',
+                taxDetailsJson: rawTaxCodeVal,
                 excessFlag: values['custrecord_giv_lw_excess_flag'] || false,
                 csvBatchId: values['custrecord_giv_lw_csv_batch_id'] || ''
             };
@@ -230,6 +234,17 @@ define([
                 let accountingItemId = '';
                 let taxDetailsLines = [];
 
+                // Enriquecer workRecords con TODOS los detalles fiscales (IEPS, IVA 0%, IVA 16%, etc.)
+                // desde la factura origen usando getAllTaxDetailsFromInvoiceLine para TODOS los escenarios.
+                const sourceWRs = workRecords.filter(wr => parseFloat(wr.amountToSettle) > 0);
+                const enrichedWRs = taxUtils.enrichWithTaxInfo(sourceWRs);
+                log.audit({title: 'enrichedWRs pao',
+                    details: enrichedWRs})
+                const enrichedMap = {};
+                enrichedWRs.forEach(wr => { enrichedMap[wr.workId] = wr; });
+                log.audit({title: 'enrichedMap',
+                    details: enrichedMap})
+
                 if (scenario === 'Agrupación') {
                     // Escenario 9 — Agrupación
                     if (!agreement || !agreement.accounting_item) {
@@ -237,11 +252,7 @@ define([
                     }
 
                     accountingItemId = agreement.accounting_item;
-
-                    // Solo registros de fuente (amountToSettle > 0) participan en el Tax Override
-                    const sourceWRs = workRecords.filter(wr => parseFloat(wr.amountToSettle) > 0);
-                    const enriched = taxUtils.enrichWithTaxInfo(sourceWRs);
-                    taxDetailsLines = taxUtils.buildTaxDetailsOverride(enriched);
+                    taxDetailsLines = taxUtils.buildTaxDetailsOverride(enrichedWRs);
 
                     // Solo registros de fuente contribuyen al CM
                     cmLines = sourceWRs.map(wr => ({
@@ -251,30 +262,27 @@ define([
 
                 } else if (scenario === 'Cobro en exceso') {
                     // Escenario 4 — Prorrateo del excedente entre líneas de fuente
-                    // DRD: Monto Final Línea = Provisión Línea + ((Provisión Línea / Total Provisión) × Excedente)
-                    // totalRequested = suma de amountToSettle del usuario (puede ser > totalAvailable)
-                    // provisionAmount = availableAmount por línea (base del prorrateo)
-                    const sourceWorkRecords = workRecords.filter(wr => parseFloat(wr.amountToSettle) > 0);
+                    const totalRequested = sourceWRs.reduce((sum, wr) => sum + (parseFloat(wr.amountToSettle) || 0), 0);
 
-                    // El total solicitado proviene de los WORK records (lo que el usuario capturó)
-                    const totalRequested = sourceWorkRecords.reduce((sum, wr) => sum + (parseFloat(wr.amountToSettle) || 0), 0);
-
-                    const linesForProration = sourceWorkRecords.map(wr => ({
+                    const linesForProration = sourceWRs.map(wr => ({
                         ...wr,
                         provisionAmount: parseFloat(wr.availableAmount) || 0  // peso = saldo disponible
                     }));
 
                     const proratedLines = validator.calculateExcessProration(linesForProration, totalRequested);
 
-                    cmLines = proratedLines.map(wr => ({
-                        itemId:      agreement.accounting_item,
-                        amount:      wr.finalAmount,
-                        taxCodeId:   wr.taxCodeId,
-                        description: `Liquidación rebate (exceso) - Acuerdo ${agreementId}`
-                    }));
+                    cmLines = proratedLines.map(wr => {
+                        const eWr = enrichedMap[wr.workId] || wr;
+                        return {
+                            itemId:      agreement.accounting_item,
+                            amount:      wr.finalAmount,
+                            taxCodeId:   wr.taxCodeId,
+                            taxRate:     parseFloat(wr.taxRate || 0),
+                            taxDetails:  eWr.taxDetails || [],
+                            description: `Liquidación rebate (exceso) - Acuerdo ${agreementId}`
+                        };
+                    });
 
-                    // [FIX 1] Actualizar cada WORK con el monto prorrateado real del CM
-                    // Antes este updateWorkRecord era un no-op (proratedAmount no estaba mapeado)
                     proratedLines.forEach(wr => {
                         txnBuilder.updateWorkRecord(wr.workId, {
                             proratedAmount: wr.finalAmount   // → custrecord_giv_lw_amt_to_settle
@@ -283,14 +291,11 @@ define([
 
                 } else {
                     // Escenarios 1, 2, 3 — solo registros de fuente (amountToSettle > 0) al CM
-
-                    // Consolidada: descripción enriquecida con nombre de acuerdo + tranid de factura origen.
-                    // Se hace un lookup por lote de las facturas únicas para no multiplicar llamadas a la API.
                     let invoiceTranIdMap = {};
                     if (scenario === 'Consolidada') {
                         const uniqueInvoiceIds = [...new Set(
-                            workRecords
-                                .filter(wr => parseFloat(wr.amountToSettle) > 0 && wr.sourceInvoiceId)
+                            sourceWRs
+                                .filter(wr => wr.sourceInvoiceId)
                                 .map(wr => wr.sourceInvoiceId)
                         )];
 
@@ -307,7 +312,7 @@ define([
                                     title:   `${MODULE}.reduce.invoiceLookup`,
                                     details: `No se pudo obtener tranid de factura ${invId}: ${le.message || le}`
                                 });
-                                invoiceTranIdMap[invId] = invId; // fallback: usar el ID interno
+                                invoiceTranIdMap[invId] = invId;
                             }
                         });
                     }
@@ -316,25 +321,25 @@ define([
 
                     if (scenario === 'Específica (por SKU)') {
                         // Agrupar por sourceItemId: 1 línea en el CM por SKU único.
-                        // Si varias provisiones comparten el mismo artículo, sus montos se suman.
                         const skuMap = {};
-                        workRecords
-                            .filter(wr => parseFloat(wr.amountToSettle) > 0)
-                            .forEach(wr => {
-                                const skuKey = wr.sourceItemId || '__sin_sku__';
-                                if (!skuMap[skuKey]) {
-                                    skuMap[skuKey] = {
-                                        sourceItemId: wr.sourceItemId,           // para lookup de nombre y descripción
-                                        itemId:       agreement.accounting_item,  // ítem contable del acuerdo (OthCharge)
-                                        amount:       0,
-                                        taxCodeId:    wr.taxCodeId               // taxCode del primer WORK del SKU
-                                    };
-                                }
-                                skuMap[skuKey].amount += parseFloat(wr.amountToSettle) || 0;
-                            });
+                        enrichedWRs.forEach(wr => {
+                            const skuKey = wr.sourceItemId || '__sin_sku__';
+                            if (!skuMap[skuKey]) {
+                                skuMap[skuKey] = {
+                                    sourceItemId: wr.sourceItemId,           // para lookup de nombre y descripción
+                                    itemId:       agreement.accounting_item,  // ítem contable del acuerdo (OthCharge)
+                                    amount:       0,
+                                    taxCodeId:    wr.taxCodeId,
+                                    taxRate:      parseFloat(wr.taxRate || 0),
+                                    taxDetails:   []
+                                };
+                            }
+                            skuMap[skuKey].amount += parseFloat(wr.amountToSettle) || 0;
+                            if (wr.taxDetails && wr.taxDetails.length > 0) {
+                                skuMap[skuKey].taxDetails.push(...wr.taxDetails);
+                            }
+                        });
 
-                        // Lookup por lote de los nombres de artículo (campo 'itemid' = código/nombre en NS)
-                        // Patrón idéntico al lookup de tranid en Consolidada — una llamada por SKU único.
                         const skuNameMap = {};
                         Object.values(skuMap).forEach(sku => {
                             if (!sku.sourceItemId) return;
@@ -350,14 +355,16 @@ define([
                                     title:   `${MODULE}.reduce.itemLookup`,
                                     details: `No se pudo obtener nombre del artículo ${sku.sourceItemId}: ${ile.message || ile}`
                                 });
-                                skuNameMap[sku.sourceItemId] = String(sku.sourceItemId); // fallback: usar el ID
+                                skuNameMap[sku.sourceItemId] = String(sku.sourceItemId);
                             }
                         });
 
                         cmLines = Object.values(skuMap).map(sku => ({
-                            itemId:      sku.itemId,                                                  // accounting_item del acuerdo
+                            itemId:      sku.itemId,
                             amount:      Math.round(sku.amount * 100) / 100,
                             taxCodeId:   sku.taxCodeId,
+                            taxRate:     sku.taxRate,
+                            taxDetails:  sku.taxDetails,
                             description: `Liquidación rebate por SKU ${skuNameMap[sku.sourceItemId] || sku.sourceItemId || ''} - Acuerdo ${agreementId}`
                         }));
 
@@ -367,23 +374,24 @@ define([
                         });
 
                     } else {
-                        cmLines = workRecords
-                            .filter(wr => parseFloat(wr.amountToSettle) > 0)
-                            .map(wr => {
-                                let description;
-                                if (scenario === 'Consolidada') {
-                                    const invoiceName = invoiceTranIdMap[wr.sourceInvoiceId] || wr.sourceInvoiceId;
-                                    description = `${agreementName} - ${invoiceName}`;
-                                } else {
-                                    description = `Liquidación rebate - Acuerdo ${agreementId}`;
-                                }
-                                return {
-                                    itemId:      agreement.accounting_item,
-                                    amount:      parseFloat(wr.amountToSettle) || 0,
-                                    taxCodeId:   wr.taxCodeId,
-                                    description: description
-                                };
-                            });
+                        cmLines = enrichedWRs.map(wr => {
+                            let description;
+                            if (scenario === 'Consolidada') {
+                                const invoiceName = invoiceTranIdMap[wr.sourceInvoiceId] || wr.sourceInvoiceId;
+                                description = `${agreementName} - ${invoiceName}`;
+                            } else {
+                                description = `Liquidación rebate - Acuerdo ${agreementId}`;
+                            }
+                            log.audit({title: 'Consolidada escenario', details: wr })
+                            return {
+                                itemId:      agreement.accounting_item,
+                                amount:      parseFloat(wr.amountToSettle) || 0,
+                                taxCodeId:   wr.taxCodeId,
+                                taxRate:     parseFloat(wr.taxRate || 0),
+                                taxDetails:  wr.taxDetails || [],
+                                description: description
+                            };
+                        });
                     }
                 }
 
@@ -481,7 +489,7 @@ define([
                     appliedAmount:          parseFloat(wr.applyAmount) || 0,
                     // [FIX 2] globalDiff = excedente total del lote, no diferencia por línea
                     difference:             globalDiff,
-                    taxCodeId:              wr.taxCodeId,
+                    taxDetailsJson:         wr.taxDetailsJson || (wr.taxDetails ? JSON.stringify(wr.taxDetails) : ''),
                     taxBasis:               parseFloat(wr.taxBasis) || 0,
                     csvBatchId:             wr.csvBatchId
                 });

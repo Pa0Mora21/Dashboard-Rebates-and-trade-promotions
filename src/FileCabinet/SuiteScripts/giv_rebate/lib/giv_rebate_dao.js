@@ -622,37 +622,12 @@ WHERE rtd.isinactive = 'F'
      * Usa record.load() en lugar de search.create() para evitar errores de columna
      * con la localización avanzada de impuestos mexicana (AT localization).
      *
-     * @param {string} invoiceId
-     * @param {string} itemId
-     * @returns {{ taxCodeId: string, taxRate: number }}
-     */
-    const getTaxInfoFromInvoiceLine = (invoiceId, itemId) => {
-        try {
-            if (!invoiceId || !itemId) return { taxCodeId: '', taxRate: 0 };
+     * AT Mexico: el campo `taxcode` del sublist `item` puede retornar vacío en server-side
+     * porque la localización lo administra internamente vía `taxdetails`.
+     * Fallback: si el campo item.taxcode está vacío, se lee el primer código desde
+     * la sublista `taxdetails` filtrada por el `taxdetailsreference` de esa línea.
+     *
 
-            // Cargar la factura directamente en memoria
-            const inv = record.load({ type: record.Type.INVOICE, id: invoiceId, isDynamic: false });
-
-            const lineCount = inv.getLineCount({ sublistId: 'item' });
-            for (let i = 0; i < lineCount; i++) {
-                const lineItemId = inv.getSublistValue({ sublistId: 'item', fieldId: 'item', line: i });
-                if (String(lineItemId) === String(itemId)) {
-                    // En AT localization, los campos del sublist 'item' son accesibles directamente
-                    const taxCodeId = inv.getSublistValue({ sublistId: 'item', fieldId: 'taxcode', line: i }) || '';
-                    const taxRate   = parseFloat(inv.getSublistValue({ sublistId: 'item', fieldId: 'taxrate', line: i })) || 0;
-                    log.debug({ title: `${MODULE}.getTaxInfoFromInvoiceLine`, details: `Invoice ${invoiceId} / Item ${itemId} → taxCode: ${taxCodeId}, rate: ${taxRate}` });
-                    return { taxCodeId: String(taxCodeId), taxRate };
-                }
-            }
-
-            log.debug({ title: `${MODULE}.getTaxInfoFromInvoiceLine`, details: `Item ${itemId} not found in invoice ${invoiceId}` });
-            return { taxCodeId: '', taxRate: 0 };
-
-        } catch (e) {
-            log.error({ title: `${MODULE}.getTaxInfoFromInvoiceLine`, details: e.message || e });
-            return { taxCodeId: '', taxRate: 0 };
-        }
-    };
 
     /**
      * Obtiene TODOS los detalles fiscales (taxdetails) de un artículo en una factura.
@@ -695,7 +670,7 @@ WHERE rtd.isinactive = 'F'
 
             for (let j = 0; j < taxDetailCount; j++) {
                 const ref = inv.getSublistValue({ sublistId: 'taxdetails', fieldId: 'taxdetailsreference', line: j }) || '';
-                if (ref === targetRef) {
+                if (String(ref) === String(targetRef)) {
                     const taxCodeId = String(inv.getSublistValue({ sublistId: 'taxdetails', fieldId: 'taxcode', line: j }) || '');
                     const taxRate   = parseFloat(inv.getSublistValue({ sublistId: 'taxdetails', fieldId: 'taxrate', line: j })) || 0;
                     const origBasis = parseFloat(inv.getSublistValue({ sublistId: 'taxdetails', fieldId: 'taxbasis', line: j })) || 0;
@@ -1135,7 +1110,6 @@ WHERE rtd.isinactive = 'F'
         getLockedAccrualAmount,
         getLockedAccrualAmounts: getLockedAccrualAmount,
         getOpenInvoices,
-        getTaxInfoFromInvoiceLine,
         getAllTaxDetailsFromInvoiceLine,
         getAgreement,
         getAgreementDetails: getAgreement,

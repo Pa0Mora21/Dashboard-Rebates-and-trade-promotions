@@ -56,6 +56,10 @@ define(['N/record', 'N/search', 'N/log', 'N/runtime'], (record, search, log, run
      * @param {string}  [params.settlementHistoryId]  ID del registro de liquidación (custbody_rm_tran_settlement_his_rel)
      */
     const createCreditMemo = (params) => {
+        log.audit({
+            title: 'params pao',
+            details: JSON.stringify(params)
+        });
         try {
             const {
                 customerId,
@@ -96,72 +100,128 @@ define(['N/record', 'N/search', 'N/log', 'N/runtime'], (record, search, log, run
             if (currency) cmRec.setValue({ fieldId: 'currency', value: currency });
             if (location) cmRec.setValue({ fieldId: 'location', value: location });
 
-            // Escenario 9 (Agrupación): una sola línea con artículo contable genérico
+            // ── FASE 1: Normalizar las líneas comerciales (cmLines) ───────────────────────
+            // En Agrupación se genera 1 sola línea por el monto total.
+            // En Escenarios 1-4 se generan N líneas (una por cada provisión/SKU).
+            let cmLines = [];
+
             if (scenario === 'Agrupación' && accountingItemId) {
                 const totalAmount = lines.reduce((sum, l) => sum + parseFloat(l.amount || 0), 0);
+                const primaryTaxCode = (taxDetailsLines && taxDetailsLines.length > 0) ? taxDetailsLines[0].taxCodeId : '';
 
-                cmRec.selectNewLine({ sublistId: 'item' });
-                cmRec.setCurrentSublistValue({ sublistId: 'item', fieldId: 'item', value: accountingItemId });
-                cmRec.setCurrentSublistValue({ sublistId: 'item', fieldId: 'amount', value: Math.round(totalAmount * 100) / 100 });
-                cmRec.setCurrentSublistValue({ sublistId: 'item', fieldId: 'description', value: 'Liquidación de reembolso comercial - Agrupación' });
-                if (location) cmRec.setCurrentSublistValue({ sublistId: 'item', fieldId: 'location', value: parseInt(location, 10) || location });
-                cmRec.commitLine({ sublistId: 'item' });
-
-                // Tax Details Override — inyectar impuestos reales del item origen
-                if (taxDetailsLines && taxDetailsLines.length > 0) {
-                    // Leer el taxDetailsReference asignado automáticamente a la línea del item
-                    const itemLineIdx = cmRec.getLineCount({ sublistId: 'item' }) - 1;
-                    const lineRef = cmRec.getSublistValue({ sublistId: 'item', fieldId: 'taxdetailsreference', line: itemLineIdx });
-
-                    log.debug({
-                        title: `${MODULE}.createCreditMemo`,
-                        details: `Item line ${itemLineIdx} taxdetailsreference = "${lineRef}"`
-                    });
-
-                    cmRec.setValue({ fieldId: 'taxdetailsoverride', value: true });
-
-                    // Limpiar líneas de impuesto auto-calculadas por NetSuite
-                    let existingTaxLines = cmRec.getLineCount({ sublistId: 'taxdetails' });
-                    for (let t = existingTaxLines - 1; t >= 0; t--) {
-                        cmRec.removeLine({ sublistId: 'taxdetails', line: t });
-                    }
-
-                    // Insertar las líneas de impuesto correctas desde la factura origen
-                    taxDetailsLines.forEach((taxLine) => {
-                        cmRec.selectNewLine({ sublistId: 'taxdetails' });
-                        if (taxLine.taxType) {
-                            cmRec.setCurrentSublistValue({ sublistId: 'taxdetails', fieldId: 'taxtype', value: taxLine.taxType });
-                        }
-                        cmRec.setCurrentSublistValue({ sublistId: 'taxdetails', fieldId: 'taxcode', value: taxLine.taxCodeId });
-                        cmRec.setCurrentSublistValue({ sublistId: 'taxdetails', fieldId: 'taxrate', value: taxLine.taxRate });
-                        cmRec.setCurrentSublistValue({ sublistId: 'taxdetails', fieldId: 'taxbasis', value: taxLine.taxBasis });
-                        cmRec.setCurrentSublistValue({ sublistId: 'taxdetails', fieldId: 'taxamount', value: taxLine.taxAmount });
-                        cmRec.setCurrentSublistValue({ sublistId: 'taxdetails', fieldId: 'taxdetailsreference', value: lineRef || '' });
-                        cmRec.commitLine({ sublistId: 'taxdetails' });
-                    });
-
-                    log.audit({
-                        title: `${MODULE}.createCreditMemo`,
-                        details: `Tax Override: ${taxDetailsLines.length} lines injected: ${JSON.stringify(taxDetailsLines)}`
-                    });
-                }
+                cmLines.push({
+                    itemId: accountingItemId,
+                    amount: Math.round(totalAmount * 100) / 100,
+                    description: 'Liquidación de reembolso comercial - Agrupación',
+                    taxCodeId: primaryTaxCode,
+                    taxDetails: taxDetailsLines || []
+                });
             } else {
-                // Escenarios 1-4: una línea por cada provisión/item
-                lines.forEach((line) => {
-                    cmRec.selectNewLine({ sublistId: 'item' });
-                    cmRec.setCurrentSublistValue({ sublistId: 'item', fieldId: 'item', value: line.itemId });
-                    cmRec.setCurrentSublistValue({ sublistId: 'item', fieldId: 'amount', value: Math.round(parseFloat(line.amount) * 100) / 100 });
+                cmLines = lines.map(line => {
+                    const taxList = (line.taxDetails && line.taxDetails.length > 0)
+                        ? line.taxDetails
+                        : (line.taxCodeId ? [{
+                            taxCodeId: line.taxCodeId,
+                            taxRate:   parseFloat(line.taxRate || 0),
+                            taxType:   line.taxType || '',
+                            taxBasis:  Math.round(parseFloat(line.amount) * 100) / 100,
+                            taxAmount: Math.round(parseFloat(line.amount) * (parseFloat(line.taxRate || 0) / 100) * 100) / 100
+                        }] : []);
 
-                    if (location) cmRec.setCurrentSublistValue({ sublistId: 'item', fieldId: 'location', value: parseInt(location, 10) || location });
-                    if (line.taxCodeId) {
-                        cmRec.setCurrentSublistValue({ sublistId: 'item', fieldId: 'taxcode', value: line.taxCodeId });
-                    }
-                    if (line.description) {
-                        cmRec.setCurrentSublistValue({ sublistId: 'item', fieldId: 'description', value: line.description });
-                    }
-                    cmRec.commitLine({ sublistId: 'item' });
+                    const primaryTaxCode = line.taxCodeId || (taxList.length > 0 ? taxList[0].taxCodeId : '');
+
+                    return {
+                        itemId: line.itemId,
+                        amount: Math.round(parseFloat(line.amount) * 100) / 100,
+                        description: line.description || '',
+                        taxCodeId: primaryTaxCode,
+                        taxDetails: taxList
+                    };
                 });
             }
+
+            // ── FASE 2: Agregar líneas comerciales en la sublista 'item' ───────────────────
+            // NOTA: 'taxdetailsoverride' debe ser FALSE durante la adición de los ítems
+            // para que NetSuite cree la estructura de impuestos e inventario 'taxdetailsreference'.
+            const itemsWithRefs = [];
+            log.audit({title: 'cmLines',
+                details: cmLines
+        });
+            cmLines.forEach((line) => {
+                cmRec.selectNewLine({ sublistId: 'item' });
+                cmRec.setCurrentSublistValue({ sublistId: 'item', fieldId: 'item', value: line.itemId });
+                cmRec.setCurrentSublistValue({ sublistId: 'item', fieldId: 'amount', value: line.amount });
+
+                if (location) cmRec.setCurrentSublistValue({ sublistId: 'item', fieldId: 'location', value: parseInt(location, 10) || location });
+                if (line.description) cmRec.setCurrentSublistValue({ sublistId: 'item', fieldId: 'description', value: line.description });
+                cmRec.commitLine({ sublistId: 'item' });
+
+                const itemLineIdx = cmRec.getLineCount({ sublistId: 'item' }) - 1;
+                const ref = cmRec.getSublistValue({ sublistId: 'item', fieldId: 'taxdetailsreference', line: itemLineIdx }) || '';
+                itemsWithRefs.push({ ref, line });
+            });
+
+            // ── FASE 3: Habilitar override de impuestos y reemplazar detalles ──────────────
+            cmRec.setValue({ fieldId: 'taxdetailsoverride', value: true });
+
+            // Limpiar impuestos calculados automáticamente por NetSuite
+            let existingTaxLines = cmRec.getLineCount({ sublistId: 'taxdetails' });
+            for (let t = existingTaxLines - 1; t >= 0; t--) {
+                cmRec.removeLine({ sublistId: 'taxdetails', line: t });
+            }
+
+            itemsWithRefs.forEach(({ ref, line }) => {
+                const taxList = line.taxDetails || [];
+
+                taxList.forEach((td) => {
+                    cmRec.selectNewLine({ sublistId: 'taxdetails' });
+
+                    // 1. IMPORTANTE: Vincular PRIMERO la referencia a la línea comercial
+                    if (ref) {
+                        cmRec.setCurrentSublistValue({ sublistId: 'taxdetails', fieldId: 'taxdetailsreference', value: ref });
+                    }
+                    if (td.taxType) {
+                        try {
+                            cmRec.setCurrentSublistValue({ sublistId: 'taxdetails', fieldId: 'taxtype', value: td.taxType });
+                        } catch (eType1) {
+                            try {
+                                cmRec.setCurrentSublistValue({ sublistId: 'taxdetails', fieldId: 'taxtype', value: parseInt(td.taxType, 10) });
+                            } catch (eType2) {
+                                log.debug({ title: `${MODULE}.createCreditMemo.taxtype`, details: eType2.message || eType2 });
+                            }
+                        }
+                    }
+
+                    // 2. Asignar taxcode PRIMERO (sin filtrar previamente por taxtype)
+                    if (td.taxCodeId) {
+                        try {
+                            cmRec.setCurrentSublistValue({ sublistId: 'taxdetails', fieldId: 'taxcode', value: td.taxCodeId });
+                        } catch (eCode1) {
+                            try {
+                                cmRec.setCurrentSublistValue({ sublistId: 'taxdetails', fieldId: 'taxcode', value: parseInt(td.taxCodeId, 10) });
+                            } catch (eCode2) {
+                                log.error({ title: `${MODULE}.createCreditMemo.taxcode`, details: `Error asignando taxcode ${td.taxCodeId}: ${eCode2.message || eCode2}` });
+                            }
+                        }
+                    }
+
+                    // 3. Asignar taxtype si está disponible
+
+                    // 4. Asignar tasa, base e importe
+                    if (td.taxRate !== undefined && td.taxRate !== null) {
+                        cmRec.setCurrentSublistValue({ sublistId: 'taxdetails', fieldId: 'taxrate', value: td.taxRate });
+                    }
+                    cmRec.setCurrentSublistValue({ sublistId: 'taxdetails', fieldId: 'taxbasis',  value: td.taxBasis || line.amount });
+                    cmRec.setCurrentSublistValue({ sublistId: 'taxdetails', fieldId: 'taxamount', value: td.taxAmount });
+
+                    cmRec.commitLine({ sublistId: 'taxdetails' });
+                });
+            });
+
+            log.audit({
+                title: 'CreateCreditMemo',
+                details: `Tax Override completado (${scenario}): ${itemsWithRefs.length} item line(s), ${cmRec.getLineCount({ sublistId: 'taxdetails' })} tax detail line(s) injected.`
+            });
 
             // ── FASE 1: Guardar el CM SIN aplicar a facturas ──────────────────────────
             // La localización AT Mexico requiere que los impuestos estén calculados
@@ -433,6 +493,16 @@ define(['N/record', 'N/search', 'N/log', 'N/runtime'], (record, search, log, run
             if (data.taxBasis) {
                 workRec.setValue({ fieldId: 'custrecord_giv_lw_tax_basis', value: parseFloat(data.taxBasis) || 0 });
             }
+            if (data.taxDetails || data.taxDetailsJson) {
+                try {
+                    const rawTax = data.taxDetailsJson || (typeof data.taxDetails === 'string' ? data.taxDetails : JSON.stringify(data.taxDetails || []));
+                    if (rawTax) {
+                        workRec.setValue({ fieldId: 'custrecord_giv_lw_taxcode', value: rawTax });
+                    }
+                } catch (eTaxJson) {
+                    log.error({ title: `${MODULE}.createWorkRecord.taxJson`, details: eTaxJson.message || eTaxJson });
+                }
+            }
             if (data.excessFlag) {
                 workRec.setValue({ fieldId: 'custrecord_giv_lw_excess_flag', value: true });
             }
@@ -516,6 +586,16 @@ define(['N/record', 'N/search', 'N/log', 'N/runtime'], (record, search, log, run
             }
             if (data.taxBasis) {
                 histRec.setValue({ fieldId: 'custrecord_giv_lh_tax_basis', value: parseFloat(data.taxBasis) || 0 });
+            }
+            if (data.taxDetails || data.taxDetailsJson) {
+                try {
+                    const rawTax = data.taxDetailsJson || (typeof data.taxDetails === 'string' ? data.taxDetails : JSON.stringify(data.taxDetails || []));
+                    if (rawTax) {
+                        histRec.setValue({ fieldId: 'custrecord_giv_lh_taxcode', value: rawTax });
+                    }
+                } catch (eTaxJson) {
+                    log.error({ title: `${MODULE}.createHistoryRecord.taxJson`, details: eTaxJson.message || eTaxJson });
+                }
             }
             if (data.csvBatchId) {
                 histRec.setValue({ fieldId: 'custrecord_giv_lh_csv_batch_id', value: data.csvBatchId });

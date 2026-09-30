@@ -552,9 +552,9 @@ define([
             // el mismo número de elementos antes de llegar aquí.
 
             sourceLines.forEach((srcLine, srcIndex) => {
-                let taxInfo = { taxCodeId: '', taxRate: 0 };
+                let allTaxDetails = [];
                 if (srcLine.sourceInvoiceId && srcLine.sourceItemId) {
-                    taxInfo = dao.getTaxInfoFromInvoiceLine(srcLine.sourceInvoiceId, srcLine.sourceItemId);
+                    allTaxDetails = dao.getAllTaxDetailsFromInvoiceLine(srcLine.sourceInvoiceId, srcLine.sourceItemId, parseFloat(srcLine.amountToSettle || 0));
                 }
 
                 // Para Estándar + CM: el reduce procesa cada WORK de forma individual
@@ -577,8 +577,8 @@ define([
                     settledAmount:    srcLine.settledAmount  || '0',
                     availableAmount:  srcLine.availableAmount,
                     amountToSettle:   srcLine.amountToSettle,
-                    taxCodeId:        taxInfo.taxCodeId,
                     taxBasis:         srcLine.amountToSettle,
+                    taxDetails:       allTaxDetails,
                     excessFlag:       scenario === 'Cobro en exceso',
                     // Estándar: origen[i] ↔ destino[i] (emparejamiento posicional)
                     invoiceTo:   pairedDest ? pairedDest.invoiceId   || '' : '',
