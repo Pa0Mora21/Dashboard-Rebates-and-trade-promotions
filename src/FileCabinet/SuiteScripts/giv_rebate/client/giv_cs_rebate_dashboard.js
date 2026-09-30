@@ -290,16 +290,33 @@ define(['N/url', 'N/currentRecord'], (url, currentRecord) => {
                 }
             }
 
-            // ── Distribuir a destinos seleccionados (en orden de fila) ──
-            // destino[0] recibe monto de origen[0], destino[1] de origen[1], etc.
+            // ── Distribuir a destinos seleccionados ──
             const dstCount = rec.getLineCount({ sublistId: DST_SUBLIST });
-            let pairIndex = 0;
+            const selectedDstLines = [];
             for (let j = 0; j < dstCount; j++) {
                 if (rec.getSublistValue({ sublistId: DST_SUBLIST, fieldId: 'custpage_dst_select', line: j })) {
-                    const amount = selectedSrcAmounts[pairIndex] !== undefined
-                        ? selectedSrcAmounts[pairIndex]
-                        : 0;
-                    rec.selectLine({ sublistId: DST_SUBLIST, line: j });
+                    selectedDstLines.push(j);
+                }
+            }
+
+            const totalSrcAmount = selectedSrcAmounts.reduce((sum, a) => sum + a, 0);
+
+            if (selectedDstLines.length === 1) {
+                // Si hay 1 sola factura destino seleccionada, recibe la suma total de las provisiones
+                const dstLine = selectedDstLines[0];
+                rec.selectLine({ sublistId: DST_SUBLIST, line: dstLine });
+                rec.setCurrentSublistValue({
+                    sublistId:         DST_SUBLIST,
+                    fieldId:           'custpage_dst_amount',
+                    value:             totalSrcAmount.toFixed(2),
+                    ignoreFieldChange: true
+                });
+                rec.commitLine({ sublistId: DST_SUBLIST });
+            } else if (selectedDstLines.length > 1) {
+                // Si hay múltiples destinos seleccionados, emparejar por posición (1 a 1)
+                selectedDstLines.forEach((dstLine, pairIndex) => {
+                    const amount = selectedSrcAmounts[pairIndex] !== undefined ? selectedSrcAmounts[pairIndex] : 0;
+                    rec.selectLine({ sublistId: DST_SUBLIST, line: dstLine });
                     rec.setCurrentSublistValue({
                         sublistId:         DST_SUBLIST,
                         fieldId:           'custpage_dst_amount',
@@ -307,8 +324,7 @@ define(['N/url', 'N/currentRecord'], (url, currentRecord) => {
                         ignoreFieldChange: true
                     });
                     rec.commitLine({ sublistId: DST_SUBLIST });
-                    pairIndex++;
-                }
+                });
             }
 
         } catch (e) {
@@ -578,35 +594,24 @@ define(['N/url', 'N/currentRecord'], (url, currentRecord) => {
             return false;
         }
 
-        // ── DRD Escenario 1 — Estándar "uno a uno" ──────────────────────────────
-        // Cada línea origen debe emparejarse con exactamente una factura destino.
-        // Si el número de orígenes ≠ destinos, el procesamiento sería ambiguo.
-        if (isCreditMemo) {
-            if (scenario === 'Estándar') {
-                // Contar orígenes seleccionados
-                let selectedSrcCount = 0;
-                for (let i = 0; i < srcCount; i++) {
-                    if (rec.getSublistValue({ sublistId: SRC_SUBLIST, fieldId: 'custpage_src_select', line: i })) {
-                        selectedSrcCount++;
-                    }
+        // ── DRD Escenario 1 — Estándar ──────────────────────────────────────────
+        // Permite múltiples líneas de provisión siempre y cuando pertenezcan a la misma factura origen.
+        if (isCreditMemo && scenario === 'Estándar') {
+            const selectedSourceInvoices = new Set();
+            for (let i = 0; i < srcCount; i++) {
+                if (rec.getSublistValue({ sublistId: SRC_SUBLIST, fieldId: 'custpage_src_select', line: i })) {
+                    const invId = rec.getSublistValue({ sublistId: SRC_SUBLIST, fieldId: 'custpage_src_invoice_id', line: i });
+                    if (invId) selectedSourceInvoices.add(invId);
                 }
+            }
 
-                // Contar destinos seleccionados
-                let selectedDstCount = 0;
-                for (let j = 0; j < dstCount; j++) {
-                    if (rec.getSublistValue({ sublistId: DST_SUBLIST, fieldId: 'custpage_dst_select', line: j })) {
-                        selectedDstCount++;
-                    }
-                }
-
-                if (selectedSrcCount !== selectedDstCount) {
-                    alert(
-                        `Escenario Estándar (uno a uno): debe seleccionar el mismo número de facturas origen y destino.\n` +
-                        `Seleccionados — Origen: ${selectedSrcCount}, Destino: ${selectedDstCount}.\n\n` +
-                        `Si necesita aplicar múltiples destinos para un mismo origen, utilice el escenario "Consolidada".`
-                    );
-                    return false;
-                }
+            if (selectedSourceInvoices.size > 1) {
+                alert(
+                    `En el escenario Estándar, todas las líneas de provisión seleccionadas deben pertenecer a la misma factura origen.\n` +
+                    `Ha seleccionado provisiones de ${selectedSourceInvoices.size} facturas origen distintas.\n\n` +
+                    `Si necesita liquidar provisiones de múltiples facturas origen en un solo Credit Memo, utilice el escenario "Consolidada".`
+                );
+                return false;
             }
         }
 

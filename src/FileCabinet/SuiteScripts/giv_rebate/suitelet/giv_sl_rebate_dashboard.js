@@ -551,18 +551,28 @@ define([
             // La validación del client script garantiza que ambas listas tienen
             // el mismo número de elementos antes de llegar aquí.
 
+            // Determinar si la asignación de factura destino va directa en cada línea origen
+            // (1 a 1 o N a 1) o si requiere registros WORK de destino separados (N a M).
+            const isPositionalEstandard = isEstandardCM && (destLines.length <= 1 || sourceLines.length === destLines.length);
+
             sourceLines.forEach((srcLine, srcIndex) => {
                 let allTaxDetails = [];
                 if (srcLine.sourceInvoiceId && srcLine.sourceItemId) {
                     allTaxDetails = dao.getAllTaxDetailsFromInvoiceLine(srcLine.sourceInvoiceId, srcLine.sourceItemId, parseFloat(srcLine.amountToSettle || 0));
                 }
 
-                // Para Estándar + CM: el reduce procesa cada WORK de forma individual
-                // (key única). invoiceTo y applyAmount deben ir embebidos en el mismo
-                // registro fuente para que el CM se aplique en el mismo reduce call.
-                // Para Consolidada/Agrupación/Exceso: los registros destino van separados
-                // (el reduce los agrupa todos bajo la misma key).
-                const pairedDest = isEstandardCM ? (destLines[srcIndex] || null) : null;
+                let pairedDest = null;
+                let pairedApplyAmount = '0';
+
+                if (isPositionalEstandard && destLines.length > 0) {
+                    if (destLines.length === 1) {
+                        pairedDest = destLines[0];
+                        pairedApplyAmount = srcLine.amountToSettle || '0';
+                    } else if (sourceLines.length === destLines.length) {
+                        pairedDest = destLines[srcIndex] || null;
+                        pairedApplyAmount = pairedDest ? (pairedDest.applyAmount || '0') : '0';
+                    }
+                }
 
                 const workData = {
                     customerId:       customerId,
@@ -580,27 +590,20 @@ define([
                     taxBasis:         srcLine.amountToSettle,
                     taxDetails:       allTaxDetails,
                     excessFlag:       scenario === 'Cobro en exceso',
-                    // Estándar: origen[i] ↔ destino[i] (emparejamiento posicional)
-                    invoiceTo:   pairedDest ? pairedDest.invoiceId   || '' : '',
-                    applyAmount: pairedDest ? pairedDest.applyAmount || '0' : '0'
+                    // Estándar posicional: asignación de factura destino y monto a aplicar
+                    invoiceTo:   pairedDest ? pairedDest.invoiceId || '' : '',
+                    applyAmount: pairedApplyAmount
                 };
 
                 const workId = txnBuilder.createWorkRecord(workData, 'Suitelet');
                 workIds.push(workId);
             });
 
-            // Consolidada / Agrupación / Cobro en exceso / Específica (por SKU) + Credit Memo:
-            // crear UN registro de aplicación POR ACUERDO POR factura destino, con el applyAmount
-            // proporcional al monto que cada acuerdo aporta al total.
-            //
-            // PROBLEMA ANTERIOR: se creaba un solo WORK de destino con agreementId = firstSrc y
-            // applyAmount = total. Esto causaba que:
-            //   - Solo el acuerdo del firstSrc recibía el WORK de destino → su CM se aplicaba con monto incorrecto.
-            //   - Los demás acuerdos generaban CMs sin ninguna aplicación.
-            //
-            // FIX: agrupar sources por acuerdo, calcular proporción y crear un destination WORK por cada par
-            // (acuerdo × factura destino) con applyAmount proporcional.
-            if (settlementMethod === '3' && destLines.length > 0 && !isEstandardCM) {
+            // Si es Credit Memo y no es posicional (Consolidada/Agrupación/Específica/Exceso o Estándar N a M):
+            // crear registros WORK de destino por cada factura destino.
+            if (settlementMethod === '3' && destLines.length > 0 && !isPositionalEstandard) {
+
+                const firstSourceInvoiceId = sourceLines.length > 0 ? sourceLines[0].sourceInvoiceId : '';
 
                 // 1. Agrupar source lines por acuerdo y sumar su amountToSettle
                 const agreementAmountMap = {};
@@ -617,7 +620,6 @@ define([
                     const dstApply = parseFloat(dst.applyAmount) || 0;
 
                     agreementEntries.forEach(([agId, agAmount]) => {
-                        // Proporción de este acuerdo sobre el total
                         const proportion = grandTotal > 0 ? agAmount / grandTotal : 1 / agreementEntries.length;
                         const proportionalApply = Math.round(dstApply * proportion * 100) / 100;
 
@@ -626,8 +628,8 @@ define([
                             agreementId:      agId,
                             settlementMethod: settlementMethod,
                             scenario:         scenario,
-                            // Campos de fuente vacíos — este registro solo define la aplicación
-                            sourceInvoiceId:  '',
+                            // En Estándar N a M asignamos firstSourceInvoiceId para que map las agrupe por factura origen
+                            sourceInvoiceId:  isEstandardCM ? firstSourceInvoiceId : '',
                             sourceAccrualId:  '',
                             sourceItemId:     '',
                             originalAmount:   '0',
@@ -638,11 +640,12 @@ define([
                             taxCodeId:        '',
                             taxBasis:         '0',
                             excessFlag:       false,
-                            invoiceTo:    dst.invoiceId || '',
-                            applyAmount:  String(proportionalApply)
+                            invoiceTo:        dst.invoiceId,
+                            applyAmount:      proportionalApply.toString()
                         };
-                        const workId = txnBuilder.createWorkRecord(dstWorkData, 'Suitelet', { ignoreMandatoryFields: true });
-                        workIds.push(workId);
+
+                        const dstWorkId = txnBuilder.createWorkRecord(dstWorkData, 'Suitelet');
+                        workIds.push(dstWorkId);
                     });
                 });
             }

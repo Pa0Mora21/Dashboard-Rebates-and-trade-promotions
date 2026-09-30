@@ -111,6 +111,12 @@ define(['N/log', './giv_rebate_dao'], (log, dao) => {
 
         switch (scenario) {
             case 'Estándar':
+                if (sourceLines && sourceLines.length > 1) {
+                    const sourceInvoices = [...new Set(sourceLines.map(l => l.sourceInvoiceId || l.invoiceId).filter(Boolean))];
+                    if (sourceInvoices.length > 1) {
+                        errors.push('En el escenario Estándar, todas las líneas de provisión seleccionadas deben pertenecer a la misma factura origen. Si desea liquidar provisiones de distintas facturas, utilice el escenario Consolidada.');
+                    }
+                }
                 break;
 
             case 'Consolidada':

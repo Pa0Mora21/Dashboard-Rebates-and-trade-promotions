@@ -115,9 +115,11 @@ define([
                 csvBatchId: values['custrecord_giv_lw_csv_batch_id'] || ''
             };
 
-            // Para escenarios que se procesan individualmente (Estándar)
+            // Para Escenario Estándar: agrupar por factura origen para permitir múltiples
+            // líneas de provisión de la misma factura en un solo Credit Memo/transacción.
             if (scenario === 'Estándar') {
-                context.write({ key: `${groupKey}_${workId}`, value: JSON.stringify(payload) });
+                const invKey = payload.sourceInvoiceId || workId;
+                context.write({ key: `${groupKey}_${invKey}`, value: JSON.stringify(payload) });
             } else {
                 context.write({ key: groupKey, value: JSON.stringify(payload) });
             }

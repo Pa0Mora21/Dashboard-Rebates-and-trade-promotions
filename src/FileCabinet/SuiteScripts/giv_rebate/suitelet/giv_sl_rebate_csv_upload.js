@@ -125,8 +125,8 @@ define([
             }
 
             // Detectar External IDs duplicados en escenarios que no los permiten.
-            // Solo Consolidada y Agrupación pueden tener múltiples filas con el mismo External ID.
-            const GROUP_SCENARIOS = new Set(['Consolidada', 'Agrupación']);
+            // Consolidada, Agrupación y Estándar pueden tener múltiples filas con el mismo External ID.
+            const GROUP_SCENARIOS = new Set(['Consolidada', 'Agrupación', 'Estándar']);
             const _invalidExtIds  = new Set();
             const preScanErrors   = [];
 
@@ -147,7 +147,7 @@ define([
                     preScanErrors.push(
                         `External ID "${extId}" aparece ${entries.length} veces en filas ` +
                         `${entries.map(e => e.rowNum).join(', ')} con escenario "${scenarios[0]}". ` +
-                        `Solo Consolidada y Agrupación permiten múltiples filas con el mismo External ID.`
+                        `Solo Consolidada, Agrupación y Estándar permiten múltiples filas con el mismo External ID.`
                     );
                     _invalidExtIds.add(extId);
                 }
