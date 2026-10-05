@@ -102,6 +102,7 @@ define([
                 sourceInvoiceId: values['custrecord_giv_lw_source_invoice']?.value || values['custrecord_giv_lw_source_invoice'] || '',
                 sourceAccrualId: values['custrecord_giv_lw_source_accrual']?.value || values['custrecord_giv_lw_source_accrual'] || '',
                 sourceItemId: values['custrecord_giv_lw_source_item']?.value || values['custrecord_giv_lw_source_item'] || '',
+                sourceItemName: values['custrecord_giv_lw_source_item']?.text || '',
                 originalAmount: values['custrecord_giv_lw_original_amt'] || '0',
                 availableAmount: values['custrecord_giv_lw_available_amt'] || '0',
                 amountToSettle: values['custrecord_giv_lw_amt_to_settle'] || '0',
@@ -267,7 +268,7 @@ define([
                     let totalRequested = sourceWRs.reduce((sum, wr) => sum + (parseFloat(wr.amountToSettle) || 0), 0);
 
                     // Guardrail: Si el usuario ingresó el exceso ($95) en la factura destino (applyAmount) en lugar de la provisión
-                    const totalApply = destWRs.reduce((sum, wr) => sum + (parseFloat(wr.applyAmount) || 0), 0);
+                    const totalApply = workRecords.reduce((sum, wr) => sum + (parseFloat(wr.applyAmount) || 0), 0);
                     if (totalApply > totalRequested) {
                         totalRequested = totalApply;
                     }
@@ -281,13 +282,14 @@ define([
 
                     cmLines = proratedLines.map(wr => {
                         const eWr = enrichedMap[wr.workId] || wr;
+                        const itemName = wr.sourceItemName || wr.sourceItemId || '';
                         return {
                             itemId:      agreement.accounting_item,
                             amount:      wr.finalAmount,
                             taxCodeId:   wr.taxCodeId,
                             taxRate:     parseFloat(wr.taxRate || 0),
                             taxDetails:  eWr.taxDetails || [],
-                            description: `Liquidación rebate (exceso) - Acuerdo ${agreementId}`
+                            description: itemName || `Liquidación rebate (exceso) - Acuerdo ${agreementId}`
                         };
                     });
 
@@ -325,7 +327,7 @@ define([
                         });
                     }
 
-                    const agreementName = agreement.name || `Acuerdo ${agreementId}`;
+                    //const agreementName = agreement.name || `Acuerdo ${agreementId}`;
 
                     if (scenario === 'Específica (por SKU)') {
                         // Agrupar por sourceItemId: 1 línea en el CM por SKU único.
@@ -339,7 +341,9 @@ define([
                                     amount:       0,
                                     taxCodeId:    wr.taxCodeId,
                                     taxRate:      parseFloat(wr.taxRate || 0),
-                                    taxDetails:   []
+                                    taxDetails:   [],
+                                    sourceItemName: wr.sourceItemName,
+
                                 };
                             }
                             skuMap[skuKey].amount += parseFloat(wr.amountToSettle) || 0;
@@ -348,33 +352,17 @@ define([
                             }
                         });
 
-                        const skuNameMap = {};
-                        Object.values(skuMap).forEach(sku => {
-                            if (!sku.sourceItemId) return;
-                            try {
-                                const itemFields = search.lookupFields({
-                                    type:    search.Type.ITEM,
-                                    id:      sku.sourceItemId,
-                                    columns: ['itemid', 'displayname']
-                                });
-                                skuNameMap[sku.sourceItemId] = itemFields.displayname || itemFields.itemid || String(sku.sourceItemId);
-                            } catch (ile) {
-                                log.error({
-                                    title:   `${MODULE}.reduce.itemLookup`,
-                                    details: `No se pudo obtener nombre del artículo ${sku.sourceItemId}: ${ile.message || ile}`
-                                });
-                                skuNameMap[sku.sourceItemId] = String(sku.sourceItemId);
-                            }
+                        cmLines = Object.values(skuMap).map(sku => {
+                            const itemName = sku.sourceItemName || sku.sourceItemId || '';
+                            return {
+                                itemId:      sku.itemId,
+                                amount:      Math.round(sku.amount * 100) / 100,
+                                taxCodeId:   sku.taxCodeId,
+                                taxRate:     sku.taxRate,
+                                taxDetails:  sku.taxDetails,
+                                description: itemName || `Liquidación rebate por SKU - Acuerdo ${agreementId}`
+                            };
                         });
-
-                        cmLines = Object.values(skuMap).map(sku => ({
-                            itemId:      sku.itemId,
-                            amount:      Math.round(sku.amount * 100) / 100,
-                            taxCodeId:   sku.taxCodeId,
-                            taxRate:     sku.taxRate,
-                            taxDetails:  sku.taxDetails,
-                            description: `Liquidación rebate por SKU ${skuNameMap[sku.sourceItemId] || sku.sourceItemId || ''} - Acuerdo ${agreementId}`
-                        }));
 
                         log.debug({
                             title:   `${MODULE}.reduce.skuGrouping`,
@@ -383,21 +371,15 @@ define([
 
                     } else {
                         cmLines = enrichedWRs.map(wr => {
-                            let description;
-                            if (scenario === 'Consolidada') {
-                                const invoiceName = invoiceTranIdMap[wr.sourceInvoiceId] || wr.sourceInvoiceId;
-                                description = `${agreementName} - ${invoiceName}`;
-                            } else {
-                                description = `Liquidación rebate - Acuerdo ${agreementId}`;
-                            }
-                            log.audit({title: 'Consolidada escenario', details: wr })
+                            const itemName = wr.sourceItemName || wr.sourceItemId || '';
+                            log.audit({ title: 'Consolidada/Estándar escenario', details: wr });
                             return {
                                 itemId:      agreement.accounting_item,
                                 amount:      parseFloat(wr.amountToSettle) || 0,
                                 taxCodeId:   wr.taxCodeId,
                                 taxRate:     parseFloat(wr.taxRate || 0),
                                 taxDetails:  wr.taxDetails || [],
-                                description: description
+                                description: itemName || `Liquidación rebate - Acuerdo ${agreementId}`
                             };
                         });
                     }

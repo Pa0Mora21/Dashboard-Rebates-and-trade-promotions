@@ -27,7 +27,8 @@
 
     <customrecordcustomfield scriptid="custrecord_giv_lh_agreement">
       <label>Agreement</label>
-      <fieldtype>INTEGER</fieldtype>
+      <fieldtype>SELECT</fieldtype>
+      <selectrecordtype>[scriptid=customrecord_rm_sales_transaction]</selectrecordtype>
       <ismandatory>T</ismandatory>
       <displaytype>NORMAL</displaytype>
     </customrecordcustomfield>

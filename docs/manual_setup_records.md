@@ -70,7 +70,7 @@
 | Label | Script ID (SDF/Código) | Type | Source/List | Mandatory |
 |---|---|---|---|---|
 | Customer | `custrecord_giv_lw_customer` | List/Record | Customer (`-2`) | ✅ |
-| Agreement | `custrecord_giv_lw_agreement` | Integer | — | ✅ |
+| Agreement | `custrecord_giv_lw_agreement` | List/Record | Rebate Agreement (`customrecord_rm_sales_transaction`) | ✅ |
 | Source Invoice | `custrecord_giv_lw_source_invoice` | List/Record | Transaction (`-30`) | ✅ |
 | Source Accrual | `custrecord_giv_lw_source_accrual` | List/Record | Transaction (`-30`) | ✅ |
 | Source Item | `custrecord_giv_lw_source_item` | List/Record | Item (`-10`) | ✅ |
