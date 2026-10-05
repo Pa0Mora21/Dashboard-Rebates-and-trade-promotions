@@ -234,7 +234,7 @@ define([
                 let cmLines = [];
                 let invoiceApplications = [];
                 let accountingItemId = '';
-                let taxDetailsLines = [];
+                let taxDetails = [];
 
                 // Enriquecer workRecords con TODOS los detalles fiscales (IEPS, IVA 0%, IVA 16%, etc.)
                 // desde la factura origen usando getAllTaxDetailsFromInvoiceLine para TODOS los escenarios.
@@ -254,7 +254,7 @@ define([
                     }
 
                     accountingItemId = agreement.accounting_item;
-                    taxDetailsLines = taxUtils.buildTaxDetailsOverride(enrichedWRs);
+                    taxDetails = taxUtils.buildTaxDetailsOverride(enrichedWRs);
 
                     // Solo registros de fuente contribuyen al CM
                     cmLines = sourceWRs.map(wr => ({
@@ -264,7 +264,13 @@ define([
 
                 } else if (scenario === 'Cobro en exceso') {
                     // Escenario 4 — Prorrateo del excedente entre líneas de fuente
-                    const totalRequested = sourceWRs.reduce((sum, wr) => sum + (parseFloat(wr.amountToSettle) || 0), 0);
+                    let totalRequested = sourceWRs.reduce((sum, wr) => sum + (parseFloat(wr.amountToSettle) || 0), 0);
+
+                    // Guardrail: Si el usuario ingresó el exceso ($95) en la factura destino (applyAmount) en lugar de la provisión
+                    const totalApply = destWRs.reduce((sum, wr) => sum + (parseFloat(wr.applyAmount) || 0), 0);
+                    if (totalApply > totalRequested) {
+                        totalRequested = totalApply;
+                    }
 
                     const linesForProration = sourceWRs.map(wr => ({
                         ...wr,
@@ -397,15 +403,46 @@ define([
                     }
                 }
 
-                // Preparar aplicación de facturas destino
+                // Preparar aplicación de facturas destino:
+                // El monto a aplicar en la factura debe ser el TOTAL BRUTO (neto + impuestos)
+                // para que el CM quede completamente aplicado sin saldo pendiente.
+                // Se calcula el taxRatio del grupo desde los sourceWRs enriquecidos.
+                const groupNetTotal = enrichedWRs.reduce((s, wr) => s + (parseFloat(wr.amountToSettle) || 0), 0);
+                const groupTaxTotal = enrichedWRs.reduce((s, wr) => {
+                    const taxDetails = wr.taxDetails || [];
+                    return s + taxDetails.reduce((ts, td) => ts + (parseFloat(td.taxAmount) || 0), 0);
+                }, 0);
+                const groupTaxRatio = groupNetTotal > 0 ? groupTaxTotal / groupNetTotal : 0;
+
                 const invoiceMap = {};
                 workRecords.forEach(wr => {
-                    if (wr.invoiceTo) {
-                        if (!invoiceMap[wr.invoiceTo]) {
-                            invoiceMap[wr.invoiceTo] = 0;
+                    if (!wr.invoiceTo) return;
+                    if (!invoiceMap[wr.invoiceTo]) invoiceMap[wr.invoiceTo] = 0;
+
+                    const eWr = enrichedMap[wr.workId] || wr;
+                    // Base neta: applyAmount si está seteado, sino amountToSettle (fuente) o 0 (destino puro)
+                    const netApply = parseFloat(wr.applyAmount) > 0
+                        ? parseFloat(wr.applyAmount)
+                        : parseFloat(wr.amountToSettle) || 0;
+
+                    let lineGrossApply = netApply;
+
+                    if (eWr.taxDetails && Array.isArray(eWr.taxDetails) && eWr.taxDetails.length > 0) {
+                        // Usar taxDetails propios del WORK (fuente o destino enriquecido)
+                        const baseAmount = parseFloat(eWr.amountToSettle) || netApply;
+                        const lineTaxSum = eWr.taxDetails.reduce((sum, td) => sum + (parseFloat(td.taxAmount) || 0), 0);
+                        if (baseAmount > 0) {
+                            lineGrossApply = netApply * (1 + lineTaxSum / baseAmount);
                         }
-                        invoiceMap[wr.invoiceTo] += parseFloat(wr.applyAmount) || 0;
+                    } else if (groupTaxRatio > 0) {
+                        // Fallback: usar el taxRatio del grupo
+                        lineGrossApply = netApply * (1 + groupTaxRatio);
+                    } else if (parseFloat(eWr.taxRate) > 0) {
+                        const ratePct = parseFloat(eWr.taxRate);
+                        lineGrossApply = netApply * (1 + (ratePct > 1 ? ratePct : ratePct * 100) / 100);
                     }
+
+                    invoiceMap[wr.invoiceTo] += lineGrossApply;
                 });
 
                 invoiceApplications = Object.entries(invoiceMap).map(([invoiceId, amount]) => ({
@@ -419,7 +456,7 @@ define([
                     invoiceApplications: invoiceApplications,
                     scenario:            scenario,
                     accountingItemId:    accountingItemId,
-                    taxDetailsLines:     taxDetailsLines,
+                    taxDetails:          taxDetails,
                     location:            locationId,
                     formId:              589  // RM Credit Memo Disbursement (confirmado vía CM80 en Sandbox)
                     // settlementHistoryId se añade en Fase posterior (post-Claim)

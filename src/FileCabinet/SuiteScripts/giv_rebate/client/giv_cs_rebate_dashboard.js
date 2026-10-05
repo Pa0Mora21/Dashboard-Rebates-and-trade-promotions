@@ -208,32 +208,37 @@ define(['N/url', 'N/currentRecord'], (url, currentRecord) => {
     const recalcTotals = (rec) => {
         try {
             const srcCount = rec.getLineCount({ sublistId: SRC_SUBLIST });
-            let totalSelected = 0;
+            let totalSelectedNet = 0;
+            let totalEstimatedTax = 0;
 
             for (let i = 0; i < srcCount; i++) {
                 const isSelected = rec.getSublistValue({ sublistId: SRC_SUBLIST, fieldId: 'custpage_src_select', line: i });
                 if (isSelected) {
-                    const amount = parseFloat(rec.getSublistValue({ sublistId: SRC_SUBLIST, fieldId: 'custpage_src_amount', line: i })) || 0;
-                    totalSelected += amount;
+                    const net   = parseFloat(rec.getSublistValue({ sublistId: SRC_SUBLIST, fieldId: 'custpage_src_amount',      line: i })) || 0;
+                    const gross = parseFloat(rec.getSublistValue({ sublistId: SRC_SUBLIST, fieldId: 'custpage_src_total_gross', line: i })) || net;
+                    totalSelectedNet  += net;
+                    totalEstimatedTax += gross - net;
                 }
             }
 
-            // ── Actualizar badge visual ──
+            const totalGrossNC = totalSelectedNet + totalEstimatedTax;
+
+            // ── Actualizar badge visual con desglose de impuestos ──
             const badge = document.getElementById('giv_total_badge');
             if (badge) {
-                const formatted = totalSelected.toLocaleString('es-MX', {
-                    minimumFractionDigits: 2,
-                    maximumFractionDigits: 2
-                });
-                badge.textContent       = `Total seleccionado: ${formatted}`;
-                badge.style.background  = totalSelected > 0 ? '#1a7f4b' : '#777';
+                const fmtNet   = totalSelectedNet.toLocaleString('es-MX', { minimumFractionDigits: 2, maximumFractionDigits: 2 });
+                const fmtTax   = totalEstimatedTax.toLocaleString('es-MX', { minimumFractionDigits: 2, maximumFractionDigits: 2 });
+                const fmtGross = totalGrossNC.toLocaleString('es-MX', { minimumFractionDigits: 2, maximumFractionDigits: 2 });
+
+                badge.innerHTML = `Subtotal: <strong>$${fmtNet}</strong> | Impuestos: <strong>$${fmtTax}</strong> | Total: <strong>$${fmtGross}</strong>`;
+                badge.style.background = totalSelectedNet > 0 ? '#1a7f4b' : '#777';
             }
 
             const scenario = rec.getValue({ fieldId: 'custpage_scenario' });
+            const settlementMethod = parseInt(rec.getValue({ fieldId: 'custpage_settlement_method' })) || null;
 
             // ── Estándar: la redistribución posicional la maneja redistributeStandardDest ──
-            // No aplicar auto-fill de total aquí para evitar sobreescribir los montos 1:1.
-            if (scenario !== SCENARIOS.STANDARD) {
+            if (scenario !== SCENARIOS.STANDARD && settlementMethod === 3) {
                 // ── Auto-distribuir si hay exactamente 1 factura destino seleccionada ──
                 const dstCount = rec.getLineCount({ sublistId: DST_SUBLIST });
                 const selectedDstLines = [];
@@ -245,12 +250,7 @@ define(['N/url', 'N/currentRecord'], (url, currentRecord) => {
 
                 if (selectedDstLines.length === 1) {
                     rec.selectLine({ sublistId: DST_SUBLIST, line: selectedDstLines[0] });
-                    rec.setCurrentSublistValue({
-                        sublistId:          DST_SUBLIST,
-                        fieldId:            'custpage_dst_amount',
-                        value:              totalSelected.toFixed(2),
-                        ignoreFieldChange:  true
-                    });
+                    rec.setCurrentSublistValue({ sublistId: DST_SUBLIST, fieldId: 'custpage_dst_amount', value: totalSelectedNet.toFixed(2), ignoreFieldChange: true });
                     rec.commitLine({ sublistId: DST_SUBLIST });
                 }
             }
@@ -265,9 +265,8 @@ define(['N/url', 'N/currentRecord'], (url, currentRecord) => {
 
     // ─────────────────────────────────────────────────────────────────────────
     //  redistributeStandardDest — Solo Escenario Estándar + Credit Memo
-    //  Asigna automáticamente el monto de cada provisión seleccionada (por orden
-    //  de fila) a la factura destino seleccionada en la misma posición.
-    //  Resultado visual: el usuario ve en tiempo real qué monto irá a cada destino.
+    //  Asigna automáticamente el monto subtotal (sin IVA) de cada provisión seleccionada
+    //  a la factura destino seleccionada en la misma posición.
     // ─────────────────────────────────────────────────────────────────────────
     /**
      * @param {Object} rec - currentRecord
@@ -280,13 +279,15 @@ define(['N/url', 'N/currentRecord'], (url, currentRecord) => {
             // Solo aplica en Estándar + Credit Memo
             if (scenario !== SCENARIOS.STANDARD || settlementMethod !== 3) return;
 
-            // ── Recolectar montos de orígenes seleccionados (en orden de fila) ──
+            // ── Recolectar montos neto y bruto de orígenes seleccionados ──
             const srcCount = rec.getLineCount({ sublistId: SRC_SUBLIST });
-            const selectedSrcAmounts = [];
+            const selectedSrcNetAmounts = [];
+            let totalSrcNetAmount = 0;
             for (let i = 0; i < srcCount; i++) {
                 if (rec.getSublistValue({ sublistId: SRC_SUBLIST, fieldId: 'custpage_src_select', line: i })) {
-                    const amount = parseFloat(rec.getSublistValue({ sublistId: SRC_SUBLIST, fieldId: 'custpage_src_amount', line: i })) || 0;
-                    selectedSrcAmounts.push(amount);
+                    const net = parseFloat(rec.getSublistValue({ sublistId: SRC_SUBLIST, fieldId: 'custpage_src_amount', line: i })) || 0;
+                    selectedSrcNetAmounts.push(net);
+                    totalSrcNetAmount += net;
                 }
             }
 
@@ -299,30 +300,16 @@ define(['N/url', 'N/currentRecord'], (url, currentRecord) => {
                 }
             }
 
-            const totalSrcAmount = selectedSrcAmounts.reduce((sum, a) => sum + a, 0);
-
             if (selectedDstLines.length === 1) {
-                // Si hay 1 sola factura destino seleccionada, recibe la suma total de las provisiones
                 const dstLine = selectedDstLines[0];
                 rec.selectLine({ sublistId: DST_SUBLIST, line: dstLine });
-                rec.setCurrentSublistValue({
-                    sublistId:         DST_SUBLIST,
-                    fieldId:           'custpage_dst_amount',
-                    value:             totalSrcAmount.toFixed(2),
-                    ignoreFieldChange: true
-                });
+                rec.setCurrentSublistValue({ sublistId: DST_SUBLIST, fieldId: 'custpage_dst_amount', value: totalSrcNetAmount.toFixed(2), ignoreFieldChange: true });
                 rec.commitLine({ sublistId: DST_SUBLIST });
             } else if (selectedDstLines.length > 1) {
-                // Si hay múltiples destinos seleccionados, emparejar por posición (1 a 1)
                 selectedDstLines.forEach((dstLine, pairIndex) => {
-                    const amount = selectedSrcAmounts[pairIndex] !== undefined ? selectedSrcAmounts[pairIndex] : 0;
+                    const netAmount = selectedSrcNetAmounts[pairIndex] !== undefined ? selectedSrcNetAmounts[pairIndex] : 0;
                     rec.selectLine({ sublistId: DST_SUBLIST, line: dstLine });
-                    rec.setCurrentSublistValue({
-                        sublistId:         DST_SUBLIST,
-                        fieldId:           'custpage_dst_amount',
-                        value:             amount.toFixed(2),
-                        ignoreFieldChange: true
-                    });
+                    rec.setCurrentSublistValue({ sublistId: DST_SUBLIST, fieldId: 'custpage_dst_amount', value: netAmount.toFixed(2), ignoreFieldChange: true });
                     rec.commitLine({ sublistId: DST_SUBLIST });
                 });
             }
@@ -331,6 +318,8 @@ define(['N/url', 'N/currentRecord'], (url, currentRecord) => {
             console.error(`[redistributeStandardDest] ${e.message}`);
         }
     };
+
+
 
     // ─────────────────────────────────────────────────────────────────────────
     //  fieldChanged — Maneja cambios en campos del formulario
@@ -618,12 +607,99 @@ define(['N/url', 'N/currentRecord'], (url, currentRecord) => {
         return true;
     };
 
+    /**
+     * Exporta todas las provisiones mostradas en la sublista a un archivo CSV/Excel.
+     */
+    const exportToExcel = () => {
+        try {
+            const rec = currentRecord.get();
+            const srcCount = rec.getLineCount({ sublistId: SRC_SUBLIST });
+
+            if (srcCount === 0) {
+                alert('No hay provisiones en pantalla para exportar.');
+                return;
+            }
+
+            const headers = [
+                'Acuerdo',
+                'Factura Origen',
+                'Artículo',
+                'Fecha Provisión',
+                'Provisión Original',
+                'Monto Liquidado',
+                'Devoluciones',
+                'Saldo Disponible',
+                'Monto a Liquidar',
+                'Tasa Impuesto (%)',
+                'Monto Impuesto',
+                'Total Bruto',
+                'Moneda'
+            ];
+
+            const rows = [headers];
+
+            for (let i = 0; i < srcCount; i++) {
+                const safeStr = (fieldId) => {
+                    const val = rec.getSublistValue({ sublistId: SRC_SUBLIST, fieldId, line: i });
+                    return val !== null && val !== undefined ? String(val) : '';
+                };
+
+                const safeNum = (fieldId) => {
+                    const val = parseFloat(rec.getSublistValue({ sublistId: SRC_SUBLIST, fieldId, line: i })) || 0;
+                    return val.toFixed(2);
+                };
+
+                rows.push([
+                    safeStr('custpage_src_agreement'),
+                    safeStr('custpage_src_invoice'),
+                    safeStr('custpage_src_item'),
+                    safeStr('custpage_src_date'),
+                    safeNum('custpage_src_original'),
+                    safeNum('custpage_src_settled'),
+                    safeNum('custpage_src_returns'),
+                    safeNum('custpage_src_available'),
+                    safeNum('custpage_src_amount'),
+                    safeNum('custpage_src_tax_rate'),
+                    safeNum('custpage_src_tax_amt'),
+                    safeNum('custpage_src_total_gross'),
+                    safeStr('custpage_src_currency')
+                ]);
+            }
+
+            // Formatear CSV con UTF-8 BOM (\uFEFF) para apertura perfecta en Microsoft Excel
+            const csvContent = '\uFEFF' + rows.map(row => 
+                row.map(field => `"${String(field).replace(/"/g, '""')}"`).join(',')
+            ).join('\r\n');
+
+            // Crear Blob y activar descarga
+            const blob = new Blob([csvContent], { type: 'text/csv;charset=utf-8;' });
+            const link = document.createElement('a');
+            const today = new Date().toISOString().slice(0, 10);
+            const fileName = `Reporte_Provisiones_Rebates_${today}.csv`;
+
+            if (navigator.msSaveBlob) {
+                navigator.msSaveBlob(blob, fileName);
+            } else {
+                link.href = URL.createObjectURL(blob);
+                link.setAttribute('download', fileName);
+                document.body.appendChild(link);
+                link.click();
+                document.body.removeChild(link);
+            }
+
+        } catch (e) {
+            console.error(`[exportToExcel] ${e.message || e}`);
+            alert('Ocurrió un error al generar el archivo de Excel.');
+        }
+    };
+
     return {
         pageInit,
         fieldChanged,
         searchAccruals,
         saveRecord,
         selectAllProvisions,
-        deselectAllProvisions
+        deselectAllProvisions,
+        exportToExcel
     };
 });

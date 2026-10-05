@@ -67,6 +67,7 @@ define(['N/record', 'N/search', 'N/log', 'N/runtime'], (record, search, log, run
                 invoiceApplications,
                 scenario,
                 accountingItemId,
+                taxDetails,
                 taxDetailsLines,
                 currency,
                 location,
@@ -105,16 +106,18 @@ define(['N/record', 'N/search', 'N/log', 'N/runtime'], (record, search, log, run
             // En Escenarios 1-4 se generan N líneas (una por cada provisión/SKU).
             let cmLines = [];
 
+            const effectiveTaxDetails = taxDetails || taxDetailsLines || [];
+
             if (scenario === 'Agrupación' && accountingItemId) {
                 const totalAmount = lines.reduce((sum, l) => sum + parseFloat(l.amount || 0), 0);
-                const primaryTaxCode = (taxDetailsLines && taxDetailsLines.length > 0) ? taxDetailsLines[0].taxCodeId : '';
+                const primaryTaxCode = (effectiveTaxDetails && effectiveTaxDetails.length > 0) ? effectiveTaxDetails[0].taxCodeId : '';
 
                 cmLines.push({
                     itemId: accountingItemId,
                     amount: Math.round(totalAmount * 100) / 100,
                     description: 'Liquidación de reembolso comercial - Agrupación',
                     taxCodeId: primaryTaxCode,
-                    taxDetails: taxDetailsLines || []
+                    taxDetails: effectiveTaxDetails
                 });
             } else {
                 cmLines = lines.map(line => {
@@ -512,7 +515,7 @@ define(['N/record', 'N/search', 'N/log', 'N/runtime'], (record, search, log, run
 
             const workId = workRec.save({
                 enableSourcing: false,
-                ignoreMandatoryFields: options.ignoreMandatoryFields === true
+                ignoreMandatoryFields: options.ignoreMandatoryFields !== false
             });
 
 
@@ -601,7 +604,7 @@ define(['N/record', 'N/search', 'N/log', 'N/runtime'], (record, search, log, run
                 histRec.setValue({ fieldId: 'custrecord_giv_lh_csv_batch_id', value: data.csvBatchId });
             }
 
-            const historyId = histRec.save({ enableSourcing: false, ignoreMandatoryFields: false });
+            const historyId = histRec.save({ enableSourcing: false, ignoreMandatoryFields: true });
 
             log.audit({
                 title: `${MODULE}.createHistoryRecord`,

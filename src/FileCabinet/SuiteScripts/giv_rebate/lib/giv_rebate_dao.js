@@ -618,86 +618,120 @@ WHERE rtd.isinactive = 'F'
     };
 
     /**
-     * Obtiene información fiscal (tax code y tasa) de una línea de factura.
-     * Usa record.load() en lugar de search.create() para evitar errores de columna
-     * con la localización avanzada de impuestos mexicana (AT localization).
+     * Obtiene detalles fiscales de uno o varios pares (invoiceId, itemId) sin record.load().
      *
-     * AT Mexico: el campo `taxcode` del sublist `item` puede retornar vacío en server-side
-     * porque la localización lo administra internamente vía `taxdetails`.
-     * Fallback: si el campo item.taxcode está vacío, se lee el primer código desde
-     * la sublista `taxdetails` filtrada por el `taxdetailsreference` de esa línea.
+     * TransactionTaxDetail NO expone transactionline como columna joineable en SuiteQL,
+     * por lo que se usan 2 queries independientes cruzadas en JS:
+     *   Q1 — netamount por (transaction, item) desde TransactionLine
+     *   Q2 — taxcode/taxrate/taxbasis/taxamount por transaction desde TransactionTaxDetail
      *
-
-
-    /**
-     * Obtiene TODOS los detalles fiscales (taxdetails) de un artículo en una factura.
-     * En AT Mexico, un solo artículo puede tener múltiples impuestos (ej. IEPS 8% + IVA 0%).
-     * Esta función lee la sublista 'taxdetails' y filtra por el taxDetailsReference de la línea.
+     * Uso individual:  getAllTaxDetailsFromInvoiceLine(invoiceId, itemId, amount)
+     * Uso batch:       getAllTaxDetailsFromInvoiceLine(null, null, null, pairs)
      *
-     * @param {string} invoiceId  Internal ID de la factura
-     * @param {string} itemId     Internal ID del artículo
-     * @param {number} amount     Monto a liquidar (para calcular bases proporcionales)
-     * @returns {Array<{taxCodeId: string, taxRate: number, taxBasis: number, taxAmount: number, origNetAmount: number}>}
+     * @param {string|null} invoiceId
+     * @param {string|null} itemId
+     * @param {number|null} amount
+     * @param {Array<{invoiceId,itemId,amount}>} [pairs]  Para uso batch
+     * @returns {Array|Object}  Array de taxLines (individual) o mapa { "invoiceId_itemId": taxLines[] } (batch)
      */
-    const getAllTaxDetailsFromInvoiceLine = (invoiceId, itemId, amount) => {
+
+
+const CHUNK_SIZE = 200;
+
+    const getAllTaxDetailsFromInvoiceLine = (invoiceId, itemId, amount, pairs) => {
+
         try {
-            if (!invoiceId || !itemId) return [];
+            const uniqueInvoiceIds = [...new Set(pairs.map(p => p.invoiceId))];
+            log.debug({ title: 'getAllTaxDetailsFromInvoiceLine', details: pairs });
+            const linesMap = {};
+            for (let i = 0; i < uniqueInvoiceIds.length; i += CHUNK_SIZE) {
+                const chunk = uniqueInvoiceIds.slice(i, i + CHUNK_SIZE);
+                const placeholders = chunk.map(() => '?').join(',');
 
-            const inv = record.load({ type: record.Type.INVOICE, id: invoiceId, isDynamic: false });
+                const rows = query.runSuiteQL({
+                    query: `
+                        SELECT tl.transaction        AS invoice_id,
+                            tl.item               AS item_id,
+                            ttd.taxcode           AS tax_code_id,
+                            ttd.taxrate           AS tax_rate,
+                            ttd.taxtype           AS tax_type,
 
-            // 1. Encontrar la línea del item y su taxDetailsReference
-            let targetRef = '';
-            let lineNetAmount = 0;
-            const lineCount = inv.getLineCount({ sublistId: 'item' });
+                            SUM(ttd.taxbasis)     AS tax_basis,
+                            SUM(ttd.taxamount)    AS tax_amount,
+                            SUM(tl.netamount)     AS net_amount
+                        FROM TransactionLine tl
+                        LEFT JOIN TransactionTaxDetail ttd
+                            ON ttd.transaction = tl.transaction
+                            AND ttd.line = tl.id
+                        WHERE tl.transaction IN (${placeholders})
+                        AND tl.mainline = 'F'
+                        AND tl.taxline = 'F'
+                        AND tl.item IS NOT NULL
+                        GROUP BY tl.transaction, tl.item, ttd.taxcode, ttd.taxrate, ttd.taxtype`,
+                        params: chunk
+                    }).asMappedResults();
+                    // log.debug({title:'rows', details: JSON.stringify(rows)});
+                rows.forEach(r => {
+                    const key = r.invoice_id + '_' + r.item_id;
+                    if (!linesMap[key]) linesMap[key] = {taxes: {} };
+                    const line = linesMap[key];
+                    if (!r.tax_code_id) return; // línea sin impuestos
+                    const netAmount = parseFloat(r.net_amount) || 0;
+                    line.netAmount = netAmount *(-1); // invertir signo para que sea positivo (neto de la factura)
+                    const rawRate = parseFloat(r.tax_rate) || 0; // decimal: 0.08 = 8%
+                    const taxKey = r.tax_code_id;
+                    line.taxes[taxKey] = {
+                        netAmount: r.netAmount,
+                        taxCodeId: String(r.tax_code_id),
+                        taxRateDecimal: rawRate,
+                        taxType: String(r.tax_type || ''),
+                        taxBasis: r.tax_basis,
+                        taxAmount: (r.tax_amount *(-1))
+                    };
 
-            for (let i = 0; i < lineCount; i++) {
-                const lineItemId = inv.getSublistValue({ sublistId: 'item', fieldId: 'item', line: i });
-                if (String(lineItemId) === String(itemId)) {
-                    targetRef = inv.getSublistValue({ sublistId: 'item', fieldId: 'taxdetailsreference', line: i }) || '';
-                    lineNetAmount = Math.abs(parseFloat(inv.getSublistValue({ sublistId: 'item', fieldId: 'amount', line: i })) || 0);
-                    break;
-                }
+                });
             }
 
-            if (!targetRef) {
-                log.debug({ title: `${MODULE}.getAllTaxDetailsFromInvoiceLine`, details: `No taxDetailsReference for item ${itemId} in invoice ${invoiceId}` });
-                return [];
-            }
-
-            // 2. Leer la sublista taxdetails y filtrar por el reference
-            const taxDetailCount = inv.getLineCount({ sublistId: 'taxdetails' });
-            const taxLines = [];
-
-            for (let j = 0; j < taxDetailCount; j++) {
-                const ref = inv.getSublistValue({ sublistId: 'taxdetails', fieldId: 'taxdetailsreference', line: j }) || '';
-                if (String(ref) === String(targetRef)) {
-                    const taxCodeId = String(inv.getSublistValue({ sublistId: 'taxdetails', fieldId: 'taxcode', line: j }) || '');
-                    const taxRate   = parseFloat(inv.getSublistValue({ sublistId: 'taxdetails', fieldId: 'taxrate', line: j })) || 0;
-                    const origBasis = parseFloat(inv.getSublistValue({ sublistId: 'taxdetails', fieldId: 'taxbasis', line: j })) || 0;
-                    const taxType   = String(inv.getSublistValue({ sublistId: 'taxdetails', fieldId: 'taxtype', line: j }) || '');
-
-                    // Calcular base proporcional: si liquidamos $1 de una línea de $200,
-                    // la base proporcional es (1/200) * origBasis
-                    const proportion = lineNetAmount > 0 ? (parseFloat(amount) || 0) / lineNetAmount : 0;
-                    const taxBasis  = Math.round(origBasis * proportion * 100) / 100;
-                    const taxAmount = Math.round(taxBasis * (taxRate / 100) * 100) / 100;
-
-                    taxLines.push({ taxCodeId, taxRate, taxBasis, taxAmount, taxType, origNetAmount: lineNetAmount });
-                }
-            }
-
-            log.debug({
-                title: `${MODULE}.getAllTaxDetailsFromInvoiceLine`,
-                details: `Invoice ${invoiceId} / Item ${itemId} / Ref ${targetRef} → ${taxLines.length} tax lines: ${JSON.stringify(taxLines)}`
+            // // log.debug({ title: 'linesMap', details: JSON.stringify(linesMap) });
+            // ---- 2) Armar resultado por cada par solicitado ----
+            const resultMap = {};
+            pairs.forEach(p => {
+                const key = p.invoiceId + '_' + p.itemId;
+                const line = linesMap[key];
+                const partial = parseFloat(p.amount);
+                const factor  = Math.abs(partial) / line.netAmount; // evitar división por cero
+                resultMap[key] =Object.values(line.taxes)
+                    .map(t => ({
+                        taxCodeId:     t.taxCodeId,
+                        taxRate:       (t.taxRateDecimal * 100),            // 8.00 para UI
+                        taxBasis:      ((t.taxBasis || line.netAmount) * factor),
+                        taxAmount:     (t.taxAmount * factor),
+                        taxType:       t.taxType,
+                        //origNetAmount: line.netAmount
+                    }));
             });
+            log.debug({ title: 'getAllTaxDetailsFromInvoiceLine', details: resultMap });
+            // // log.debug({ title: 'resultMap', details: JSON.stringify(resultMap) });
 
-            return taxLines;
+            return resultMap;
 
         } catch (e) {
-            log.error({ title: `${MODULE}.getAllTaxDetailsFromInvoiceLine`, details: `[Inv=${invoiceId}, Item=${itemId}] ${e.message || e}` });
-            return [];
+
+            log.error({
+                title:'ERROS in getAllTaxDetailsFromInvoiceLine',
+                details: e.message
+            });
+            return {};
         }
     };
+    /**
+     * Versión batch: resuelve detalles fiscales de múltiples pares en 2 queries totales.
+     * Wrapper de getAllTaxDetailsFromInvoiceLine para compatibilidad con callers existentes.
+     *
+     * @param {Array<{invoiceId: string, itemId: string, amount: number}>} pairs
+     * @returns {Object}  Mapa { "invoiceId_itemId": taxLines[] }
+     */
+    const getAllTaxDetailsBatch = (pairs) => getAllTaxDetailsFromInvoiceLine(null, null, null, pairs);
 
     /**
      * Obtiene datos de un acuerdo de rebate por su Internal ID.
@@ -1111,6 +1145,7 @@ WHERE rtd.isinactive = 'F'
         getLockedAccrualAmounts: getLockedAccrualAmount,
         getOpenInvoices,
         getAllTaxDetailsFromInvoiceLine,
+        getAllTaxDetailsBatch,
         getAgreement,
         getAgreementDetails: getAgreement,
         getPendingWorkRecords,

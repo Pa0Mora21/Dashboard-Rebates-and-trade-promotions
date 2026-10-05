@@ -146,13 +146,17 @@ define([
             sourceSublist.addField({ id: 'custpage_src_settled', type: serverWidget.FieldType.CURRENCY, label: LBL.SRC_SETTLED });
             sourceSublist.addField({ id: 'custpage_src_returns', type: serverWidget.FieldType.CURRENCY, label: LBL.SRC_RETURNS });
             sourceSublist.addField({ id: 'custpage_src_available', type: serverWidget.FieldType.CURRENCY, label: LBL.SRC_AVAILABLE });
-            sourceSublist.addField({ id: 'custpage_src_amount', type: serverWidget.FieldType.CURRENCY, label: LBL.SRC_AMOUNT })
+           sourceSublist.addField({ id: 'custpage_src_amount', type: serverWidget.FieldType.CURRENCY, label: LBL.SRC_AMOUNT })
                 .updateDisplayType({ displayType: serverWidget.FieldDisplayType.ENTRY });
+            sourceSublist.addField({ id: 'custpage_src_tax_rate',    type: serverWidget.FieldType.PERCENT,   label: LBL.SRC_TAX_RATE });
+            sourceSublist.addField({ id: 'custpage_src_tax_amt',     type: serverWidget.FieldType.CURRENCY,  label: LBL.SRC_TAX_AMT });
+            sourceSublist.addField({ id: 'custpage_src_total_gross', type: serverWidget.FieldType.CURRENCY,  label: LBL.SRC_TOTAL_GROSS });
             sourceSublist.addField({ id: 'custpage_src_currency', type: serverWidget.FieldType.TEXT, label: LBL.CURRENCY });
 
             // ── Botones de selección masiva (dentro del toolbar de la sublista) ──
             sourceSublist.addButton({ id: 'custpage_select_all',   label: LBL.BTN_SELECT_ALL   || 'Seleccionar Todas', functionName: 'selectAllProvisions'   });
             sourceSublist.addButton({ id: 'custpage_deselect_all', label: LBL.BTN_DESELECT_ALL || 'Desmarcar Todas',   functionName: 'deselectAllProvisions' });
+            sourceSublist.addButton({ id: 'custpage_export_excel_sublist', label: 'Exportar a Excel', functionName: 'exportToExcel' });
 
             // Campos ocultos
             sourceSublist.addField({ id: 'custpage_src_accrual_id', type: serverWidget.FieldType.TEXT, label: 'Accrual ID' }).updateDisplayType({ displayType: serverWidget.FieldDisplayType.HIDDEN });
@@ -256,6 +260,8 @@ define([
                 destSublist.addField({ id: 'custpage_dst_amount', type: serverWidget.FieldType.CURRENCY, label: LBL.DST_AMOUNT })
                     .updateDisplayType({ displayType: serverWidget.FieldDisplayType.ENTRY });
                 destSublist.addField({ id: 'custpage_dst_currency', type: serverWidget.FieldType.TEXT, label: LBL.CURRENCY });
+                // Campo oculto para transportar el subtotal neto al M/R
+                destSublist.addField({ id: 'custpage_dst_subtotal', type: serverWidget.FieldType.CURRENCY, label: 'Subtotal' }).updateDisplayType({ displayType: serverWidget.FieldDisplayType.HIDDEN });
             }
 
             if (hasFilters) {
@@ -269,7 +275,7 @@ define([
                 if (params.custpage_item)            defaults.custpage_item            = params.custpage_item;
                 form.updateDefaultValues(defaults);
 
-                populateSourceSublist(sourceSublist, params);
+                populateSourceSublist(sourceSublist, params, LBL);
                 populateDestSublist(destSublist, params, settlementMethod);
             }
 
@@ -292,7 +298,7 @@ define([
     /**
      * Puebla la sublista de provisiones disponibles.
      */
-    const populateSourceSublist = (sublist, params) => {
+    const populateSourceSublist = (sublist, params, LBL) => {
         try {
             log.debug('Dashboard Params', params);
             const filters = {};
@@ -310,9 +316,9 @@ define([
             if (params.custpage_item) {
                 const itemParts = params.custpage_item.split('\u0005').filter(Boolean);
                 if (itemParts.length > 1) {
-                    filters.itemIds = itemParts;       // MULTISELECT: múltiples artículos
+                    filters.itemIds = itemParts;
                 } else if (itemParts.length === 1) {
-                    filters.itemId = itemParts[0];     // un solo artículo
+                    filters.itemId = itemParts[0];
                 }
             }
             if (params.custpage_date_from) filters.dateFrom = params.custpage_date_from;
@@ -321,7 +327,13 @@ define([
             const accruals = dao.getAvailableAccruals(filters);
             log.debug('Accruals Found', accruals.length);
 
-            sublist.label = 'Provisiones Disponibles (' + accruals.length + ')';
+            sublist.label = `${LBL.SRC_TITLE} (${accruals.length})`;
+
+            // Pre-calcular impuestos de todos los accruals en UNA sola query batch
+            const taxPairs = accruals
+                .filter(a => a.invoiceId && a.itemId)
+                .map(a => ({ invoiceId: a.invoiceId, itemId: a.itemId, amount: parseFloat(a.availableAmount) || 0 }));
+            const taxBatchMap = dao.getAllTaxDetailsBatch(taxPairs);
 
             accruals.forEach((accrual, index) => {
                 // Función helper para valores seguros
@@ -350,6 +362,24 @@ define([
                     sublist.setSublistValue({ id: 'custpage_src_available',  line: index, value: safeNumber(accrual.availableAmount) });
                     // Pre-poblar "Monto a Liquidar" con el saldo disponible (editable por el usuario)
                     sublist.setSublistValue({ id: 'custpage_src_amount',     line: index, value: safeNumber(accrual.availableAmount) });
+
+                    // Pre-cálculo de impuestos desde el mapa batch
+                    const taxKey     = `${accrual.invoiceId}_${accrual.itemId}`;
+                    const taxDetails = taxBatchMap[taxKey] || [];
+                    const available  = parseFloat(accrual.availableAmount) || 0;
+                    // taxAmount se recalcula con el availableAmount real del accrual
+                    // porque el batch map usa lineNetAmount (total de la línea en la factura)
+                    const totalTaxAmt = taxDetails.reduce((sum, td) => {
+                        const rate = (parseFloat(td.taxRate) || 0) / 100;  // taxRate ya viene como 8.00
+                        return sum + Math.round(available * rate * 100) / 100;
+                    }, 0);
+                    const primaryRate = taxDetails.length > 0 ? (parseFloat(taxDetails[0].taxRate) || 0) : 0;
+                    const grossTotal  = available + totalTaxAmt;
+
+                    sublist.setSublistValue({ id: 'custpage_src_tax_rate',    line: index, value: primaryRate.toFixed(2) });
+                    sublist.setSublistValue({ id: 'custpage_src_tax_amt',     line: index, value: totalTaxAmt.toFixed(2) });
+                    sublist.setSublistValue({ id: 'custpage_src_total_gross', line: index, value: grossTotal.toFixed(2) });
+
                     sublist.setSublistValue({ id: 'custpage_src_currency',   line: index, value: safeValue(accrual.currencyText, 'MXN') });
 
                     // Campos ocultos - SIEMPRE deben tener valor
@@ -418,7 +448,7 @@ define([
                 sublist.setSublistValue({ id: 'custpage_dst_date', line: index, value: inv.date || '' });
                 sublist.setSublistValue({ id: 'custpage_dst_total', line: index, value: inv.total.toFixed(2) });
                 sublist.setSublistValue({ id: 'custpage_dst_open', line: index, value: inv.amountRemaining.toFixed(2) });
-                sublist.setSublistValue({ id: 'custpage_dst_amount', line: index, value: inv.amountRemaining.toFixed(2) }); // pre-populated, editable
+                sublist.setSublistValue({ id: 'custpage_dst_amount', line: index, value: inv.amountRemaining.toFixed(2) });
                 sublist.setSublistValue({ id: 'custpage_dst_currency', line: index, value: inv.currencyText || '' });
             });
 
@@ -468,7 +498,7 @@ define([
                 const selected = request.getSublistValue({ group: 'custpage_dest_sublist', name: 'custpage_dst_select', line: j });
                 if (selected === 'T') {
                     destLines.push({
-                        invoiceId: request.getSublistValue({ group: 'custpage_dest_sublist', name: 'custpage_dst_invoice_id', line: j }),
+                       invoiceId: request.getSublistValue({ group: 'custpage_dest_sublist', name: 'custpage_dst_invoice_id', line: j }),
                         applyAmount: request.getSublistValue({ group: 'custpage_dest_sublist', name: 'custpage_dst_amount', line: j })
                     });
                 }
@@ -555,11 +585,14 @@ define([
             // (1 a 1 o N a 1) o si requiere registros WORK de destino separados (N a M).
             const isPositionalEstandard = isEstandardCM && (destLines.length <= 1 || sourceLines.length === destLines.length);
 
+            // Pre-calcular impuestos de todas las líneas origen en una sola llamada batch
+            const taxPairsPost = sourceLines
+                .filter(s => s.sourceInvoiceId && s.sourceItemId)
+                .map(s => ({ invoiceId: s.sourceInvoiceId, itemId: s.sourceItemId, amount: parseFloat(s.amountToSettle) || 0 }));
+            const taxBatchMapPost = dao.getAllTaxDetailsBatch(taxPairsPost);
+
             sourceLines.forEach((srcLine, srcIndex) => {
-                let allTaxDetails = [];
-                if (srcLine.sourceInvoiceId && srcLine.sourceItemId) {
-                    allTaxDetails = dao.getAllTaxDetailsFromInvoiceLine(srcLine.sourceInvoiceId, srcLine.sourceItemId, parseFloat(srcLine.amountToSettle || 0));
-                }
+                const allTaxDetails = taxBatchMapPost[`${srcLine.sourceInvoiceId}_${srcLine.sourceItemId}`] || [];
 
                 let pairedDest = null;
                 let pairedApplyAmount = '0';

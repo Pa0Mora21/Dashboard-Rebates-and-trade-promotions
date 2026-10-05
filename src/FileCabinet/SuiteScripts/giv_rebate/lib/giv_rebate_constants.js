@@ -48,8 +48,11 @@ define([], () => {
             SRC_RETURNS:   'Devoluciones',
             SRC_LOCKED:    'Bloqueado',
             SRC_AVAILABLE: 'Saldo Disponible',
-            SRC_AMOUNT:    'Monto a Liquidar',
-            CURRENCY:      'Moneda',
+            SRC_AMOUNT:      'Monto a Liquidar',
+            SRC_TAX_RATE:    'Porcentaje (%)',
+            SRC_TAX_AMT:     'Impuesto Estimado',
+            SRC_TOTAL_GROSS: 'Total ',
+            CURRENCY:        'Moneda',
 
             // Sublista destino
             DST_TITLE:    'Facturas Destino (Credit Memo)',
@@ -99,8 +102,11 @@ define([], () => {
             SRC_RETURNS:   'Returns',
             SRC_LOCKED:    'Locked',
             SRC_AVAILABLE: 'Available Balance',
-            SRC_AMOUNT:    'Amount to Settle',
-            CURRENCY:      'Currency',
+            SRC_AMOUNT:      'Amount to Settle',
+            SRC_TAX_RATE:    'Percentage (%)',
+            SRC_TAX_AMT:     'Est. Tax',
+            SRC_TOTAL_GROSS: 'Total',
+            CURRENCY:        'Currency',
 
             DST_TITLE:    'Destination Invoices (Credit Memo)',
             DST_INVOICE:  'Invoice',
