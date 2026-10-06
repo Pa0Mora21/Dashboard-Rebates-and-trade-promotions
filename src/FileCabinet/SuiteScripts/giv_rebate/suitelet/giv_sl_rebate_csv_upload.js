@@ -125,8 +125,8 @@ define([
             }
 
             // Detectar External IDs duplicados en escenarios que no los permiten.
-            // Consolidada, Agrupación y Estándar pueden tener múltiples filas con el mismo External ID.
-            const GROUP_SCENARIOS = new Set(['Consolidada', 'Agrupación', 'Estándar']);
+            // Consolidada, Agrupación, Estándar y Específica (por SKU) pueden tener múltiples filas con el mismo External ID.
+            const GROUP_SCENARIOS = new Set(['Consolidada', 'Agrupación', 'Estándar', 'Específica (por SKU)']);
             const _invalidExtIds  = new Set();
             const preScanErrors   = [];
 
@@ -147,7 +147,7 @@ define([
                     preScanErrors.push(
                         `External ID "${extId}" aparece ${entries.length} veces en filas ` +
                         `${entries.map(e => e.rowNum).join(', ')} con escenario "${scenarios[0]}". ` +
-                        `Solo Consolidada, Agrupación y Estándar permiten múltiples filas con el mismo External ID.`
+                        `Solo Consolidada, Agrupación, Estándar y Específica (por SKU) permiten múltiples filas con el mismo External ID.`
                     );
                     _invalidExtIds.add(extId);
                 }
@@ -206,6 +206,7 @@ define([
             // su suma no puede superar el saldo disponible (excepto en Cobro en exceso).
             // Clave: sourceAccrualId | Valor: suma de amountToSettle ya comprometido en Fase 1.
             const batchAccrualUsage = {};
+            const extGroupTotals    = {};
 
             for (let i = 1; i < rows.length; i++) {
                 try {
@@ -312,8 +313,10 @@ define([
                         // Validación acumulada dentro del mismo lote CSV.
                         // El check de concurrencia (getLockedAccrualAmounts) no detecta otras filas
                         // del mismo CSV porque los WORKs aún no existen en BD en este momento.
-                        // Si dos filas apuntan al mismo accrual, la suma no puede superar el disponible.
-                        const alreadyCommitted  = batchAccrualUsage[sourceAccrualId] || 0;
+                        // Se indexa por (sourceAccrualId + itemId) para que cada ítem de la factura
+                        // tenga su propio control de saldo en el lote.
+                        const accrualUsageKey   = `${sourceAccrualId}_${rowData.itemId}`;
+                        const alreadyCommitted  = batchAccrualUsage[accrualUsageKey] || 0;
                         const rowAmount         = parseFloat(rowData.amountToSettle) || 0;
                         const totalInBatch      = Math.round((alreadyCommitted + rowAmount) * 100) / 100;
                         const roundedAvailable  = Math.round(availableAmount * 100) / 100;
@@ -331,29 +334,40 @@ define([
                         }
                     }
 
-                    // Validación coherencia applyAmount vs amountToSettle (Credit Memo)
+                    // Acumular totales por External ID (o por fila) para validación en grupo de applyAmount vs amountToSettle
                     if (settlementMethod === '3') {
-                        const _settle = parseFloat(rowData.amountToSettle) || 0;
-                        const _apply  = parseFloat(rowData.applyAmount)    || 0;
-                        if (_apply > Math.round(_settle * 100) / 100 + 0.001) {
-                            validationErrors.push(
-                                `Fila ${i}: El Monto a Aplicar ($${_apply.toFixed(2)}) ` +
-                                `no puede ser mayor al Monto a Liquidar ($${_settle.toFixed(2)}). ` +
-                                `El CM se genera por el monto liquidado; solo puede aplicarse hasta ese importe.`
-                            );
-                            continue;
+                        const extKey = rowData.externalId ? `ext_${rowData.externalId}` : `row_${i}`;
+                        if (!extGroupTotals[extKey]) {
+                            extGroupTotals[extKey] = {
+                                extId:       rowData.externalId,
+                                totalSettle: 0,
+                                totalApply:  0,
+                                rows:        []
+                            };
                         }
+                        extGroupTotals[extKey].totalSettle += parseFloat(rowData.amountToSettle) || 0;
+                        extGroupTotals[extKey].totalApply  += parseFloat(rowData.applyAmount)   || 0;
+                        extGroupTotals[extKey].rows.push(i);
                     }
 
                     // Fila 100% válida — registrar en acumulador de lote y guardar para Fase 2.
                     // El acumulador se actualiza SOLO cuando la fila pasa todas las validaciones,
                     // para no contar filas rechazadas como monto comprometido.
                     if (rowData.scenario !== 'Cobro en exceso') {
-                        const rowAmt = parseFloat(rowData.amountToSettle) || 0;
-                        batchAccrualUsage[sourceAccrualId] = (batchAccrualUsage[sourceAccrualId] || 0) + rowAmt;
+                        const rowAmt          = parseFloat(rowData.amountToSettle) || 0;
+                        const accrualUsageKey = `${sourceAccrualId}_${rowData.itemId}`;
+                        batchAccrualUsage[accrualUsageKey] = (batchAccrualUsage[accrualUsageKey] || 0) + rowAmt;
                     }
 
-                    const taxDetails = dao.getAllTaxDetailsFromInvoiceLine(rowData.sourceInvoiceId, rowData.itemId, parseFloat(rowData.amountToSettle || 0));
+                    const pairs = [{
+                        invoiceId: rowData.sourceInvoiceId,
+                        itemId:    rowData.itemId,
+                        amount:    parseFloat(rowData.amountToSettle || 0)
+                    }];
+                    const taxMap     = dao.getAllTaxDetailsFromInvoiceLine(null, null, null, pairs);
+                    const taxKey     = `${rowData.sourceInvoiceId}_${rowData.itemId}`;
+                    const taxDetails = (taxMap && Array.isArray(taxMap[taxKey])) ? taxMap[taxKey] : [];
+
                     validRows.push({
                         rowIndex:         i,
                         rowData:          rowData,
@@ -368,6 +382,23 @@ define([
                     validationErrors.push(`Fila ${i}: Error inesperado — ${rowErr.message || rowErr}`);
                 }
             }
+
+            // Validar coherencia applyAmount vs amountToSettle a nivel de grupo (External ID o Fila)
+            Object.keys(extGroupTotals).forEach(key => {
+                const grp     = extGroupTotals[key];
+                const _settle = Math.round(grp.totalSettle * 100) / 100;
+                const _apply  = Math.round(grp.totalApply  * 100) / 100;
+                if (_apply > _settle + 0.001) {
+                    const label = grp.extId
+                        ? `External ID "${grp.extId}" (Filas ${grp.rows.join(', ')})`
+                        : `Fila ${grp.rows[0]}`;
+                    validationErrors.push(
+                        `${label}: El Monto a Aplicar total ($${_apply.toFixed(2)}) ` +
+                        `no puede ser mayor al Monto a Liquidar total ($${_settle.toFixed(2)}). ` +
+                        `El Credit Memo se genera por el monto liquidado total del grupo; solo puede aplicarse hasta ese importe.`
+                    );
+                }
+            });
 
             // ── Si hay cualquier error → mostrar pantalla y abortar (sin WORKs) ──────────
             if (validationErrors.length > 0) {

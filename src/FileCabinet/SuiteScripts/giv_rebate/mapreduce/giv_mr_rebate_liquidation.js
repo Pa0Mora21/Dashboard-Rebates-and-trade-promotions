@@ -336,30 +336,51 @@ define([
                             const skuKey = wr.sourceItemId || '__sin_sku__';
                             if (!skuMap[skuKey]) {
                                 skuMap[skuKey] = {
-                                    sourceItemId: wr.sourceItemId,           // para lookup de nombre y descripción
-                                    itemId:       agreement.accounting_item,  // ítem contable del acuerdo (OthCharge)
-                                    amount:       0,
-                                    taxCodeId:    wr.taxCodeId,
-                                    taxRate:      parseFloat(wr.taxRate || 0),
-                                    taxDetails:   [],
+                                    sourceItemId:   wr.sourceItemId,           // para lookup de nombre y descripción
+                                    itemId:         agreement.accounting_item,  // ítem contable del acuerdo (OthCharge)
+                                    amount:         0,
+                                    taxCodeId:      wr.taxCodeId,
+                                    taxRate:        parseFloat(wr.taxRate || 0),
+                                    taxDetailsMap:  {},
                                     sourceItemName: wr.sourceItemName,
-
                                 };
                             }
                             skuMap[skuKey].amount += parseFloat(wr.amountToSettle) || 0;
                             if (wr.taxDetails && wr.taxDetails.length > 0) {
-                                skuMap[skuKey].taxDetails.push(...wr.taxDetails);
+                                wr.taxDetails.forEach(td => {
+                                    const tcKey = String(td.taxCodeId || '');
+                                    if (!tcKey) return;
+                                    if (!skuMap[skuKey].taxDetailsMap[tcKey]) {
+                                        skuMap[skuKey].taxDetailsMap[tcKey] = {
+                                            taxCodeId: td.taxCodeId,
+                                            taxRate:   td.taxRate || 0,
+                                            taxType:   td.taxType || '',
+                                            taxBasis:  0,
+                                            taxAmount: 0
+                                        };
+                                    }
+                                    skuMap[skuKey].taxDetailsMap[tcKey].taxBasis  += parseFloat(td.taxBasis  || 0);
+                                    skuMap[skuKey].taxDetailsMap[tcKey].taxAmount += parseFloat(td.taxAmount || 0);
+                                });
                             }
                         });
 
                         cmLines = Object.values(skuMap).map(sku => {
                             const itemName = sku.sourceItemName || sku.sourceItemId || '';
+                            const consolidatedTaxDetails = Object.values(sku.taxDetailsMap).map(td => ({
+                                taxCodeId: td.taxCodeId,
+                                taxRate:   td.taxRate,
+                                taxType:   td.taxType,
+                                taxBasis:  Math.round(td.taxBasis  * 100) / 100,
+                                taxAmount: Math.round(td.taxAmount * 100) / 100
+                            }));
+
                             return {
                                 itemId:      sku.itemId,
                                 amount:      Math.round(sku.amount * 100) / 100,
                                 taxCodeId:   sku.taxCodeId,
                                 taxRate:     sku.taxRate,
-                                taxDetails:  sku.taxDetails,
+                                taxDetails:  consolidatedTaxDetails,
                                 description: itemName || `Liquidación rebate por SKU - Acuerdo ${agreementId}`
                             };
                         });
