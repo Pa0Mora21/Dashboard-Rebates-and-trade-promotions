@@ -234,6 +234,27 @@ define([
                 log.debug({ title: `${MODULE}.renderDashboard - Settlement Method`, details: `Agreement ${firstAgreementId} → method=${settlementMethod}` });
             }
 
+            let accruals = [];
+            if (hasFilters) {
+                const defaults = {};
+                if (params.custpage_agreement)      defaults.custpage_agreement      = params.custpage_agreement;
+                if (params.custpage_customer)        defaults.custpage_customer        = params.custpage_customer;
+                if (params.custpage_source_invoice)  defaults.custpage_source_invoice  = params.custpage_source_invoice;
+                if (params.custpage_scenario)        defaults.custpage_scenario        = params.custpage_scenario;
+                if (params.custpage_date_from)       defaults.custpage_date_from       = params.custpage_date_from;
+                if (params.custpage_date_to)         defaults.custpage_date_to         = params.custpage_date_to;
+                if (params.custpage_item)            defaults.custpage_item            = params.custpage_item;
+                form.updateDefaultValues(defaults);
+
+                accruals = populateSourceSublist(sourceSublist, params, LBL);
+
+                // Si no se filtró por acuerdo explícitamente, inferir el método desde las provisiones encontradas
+                if (!settlementMethod && accruals.length > 0) {
+                    settlementMethod = parseInt(accruals[0].settlementMethod) || null;
+                    log.debug({ title: `${MODULE}.renderDashboard - Inferred Settlement Method`, details: `From accruals → method=${settlementMethod}` });
+                }
+            }
+
             // Campo hidden para que el client script conozca el método
             const settlementMethodField = form.addField({
                 id: 'custpage_settlement_method',
@@ -264,19 +285,8 @@ define([
                 destSublist.addField({ id: 'custpage_dst_subtotal', type: serverWidget.FieldType.CURRENCY, label: 'Subtotal' }).updateDisplayType({ displayType: serverWidget.FieldDisplayType.HIDDEN });
             }
 
-            if (hasFilters) {
-                const defaults = {};
-                if (params.custpage_agreement)      defaults.custpage_agreement      = params.custpage_agreement;
-                if (params.custpage_customer)        defaults.custpage_customer        = params.custpage_customer;
-                if (params.custpage_source_invoice)  defaults.custpage_source_invoice  = params.custpage_source_invoice;
-                if (params.custpage_scenario)        defaults.custpage_scenario        = params.custpage_scenario;
-                if (params.custpage_date_from)       defaults.custpage_date_from       = params.custpage_date_from;
-                if (params.custpage_date_to)         defaults.custpage_date_to         = params.custpage_date_to;
-                if (params.custpage_item)            defaults.custpage_item            = params.custpage_item;
-                form.updateDefaultValues(defaults);
-
-                populateSourceSublist(sourceSublist, params, LBL);
-                populateDestSublist(destSublist, params, settlementMethod);
+            if (hasFilters && destSublist) {
+                populateDestSublist(destSublist, params, settlementMethod, accruals);
             }
 
             // Campo hidden para acción POST
@@ -297,6 +307,11 @@ define([
 
     /**
      * Puebla la sublista de provisiones disponibles.
+     *
+     * @param {Object} sublist
+     * @param {Object} params
+     * @param {Object} LBL
+     * @returns {Object[]} accruals encontrados
      */
     const populateSourceSublist = (sublist, params, LBL) => {
         try {
@@ -401,9 +416,11 @@ define([
             });
 
             log.debug({ title: `${MODULE}.populateSourceSublist`, details: `Populated ${accruals.length} source lines` });
+            return accruals;
 
         } catch (e) {
             log.error({ title: `${MODULE}.populateSourceSublist`, details: e.message || e });
+            return [];
         }
     };
 
@@ -414,10 +431,11 @@ define([
      * @param {Object} sublist
      * @param {Object} params
      * @param {number|null} settlementMethod  - Valor numérico de custrecord_rm_settlement_method
+     * @param {Object[]} [accruals]           - Provisiones encontradas en la búsqueda origen
      */
-    const populateDestSublist = (sublist, params, settlementMethod) => {
+    const populateDestSublist = (sublist, params, settlementMethod, accruals = []) => {
         try {
-            if (!params.custpage_agreement) return;
+            if (!sublist) return;
 
             // DRD Punto 4: Solo mostrar facturas destino cuando el método sea Credit Memo
             if (settlementMethod !== null && settlementMethod !== CONST.SETTLEMENT_METHOD.CREDIT_MEMO) {
@@ -428,16 +446,31 @@ define([
                 return;
             }
 
-            // Parsear multiselect de acuerdos (\u0005 es el delimitador de NetSuite multiselect)
-            const agreementIds = (params.custpage_agreement || '').split('\u0005').map(s => s.trim()).filter(Boolean);
-            if (agreementIds.length === 0) return;
+            // 1. Clientes seleccionados explícitamente en el filtro Customer
+            const filterCustomerIds = (params.custpage_customer || '').split('\u0005').map(s => s.trim()).filter(Boolean);
 
-            const customerIds = dao.getCustomersByAgreement(agreementIds);
-            if (customerIds.length === 0) {
-                log.debug({ title: `${MODULE}.populateDestSublist`, details: `No customers found for agreements: [${agreementIds.join(',')}]` });
-                return;
+            let customerIds = [];
+            if (filterCustomerIds.length > 0) {
+                // Si el usuario seleccionó cliente(s) y/o subcliente(s), traer facturas destino de esos clientes
+                customerIds = [...new Set(filterCustomerIds)];
+            } else {
+                // Si no seleccionó filtro de cliente (ej. filtró por Item, Source Invoice o Agreement),
+                // derivar los clientes a partir de los acuerdos y de las provisiones encontradas
+                const filterAgreementIds  = (params.custpage_agreement || '').split('\u0005').map(s => s.trim()).filter(Boolean);
+                const accrualAgreementIds = accruals.map(a => a.agreementId).filter(Boolean);
+                const agreementIds        = [...new Set([...filterAgreementIds, ...accrualAgreementIds])];
+
+                const agreementCustomerIds = agreementIds.length > 0 ? dao.getCustomersByAgreement(agreementIds) : [];
+                const accrualCustomerIds   = accruals.map(a => a.customerId).filter(Boolean);
+                const accrualPayerIds      = accruals.map(a => a.payerId).filter(Boolean);
+
+                customerIds = [...new Set([...agreementCustomerIds, ...accrualCustomerIds, ...accrualPayerIds])];
             }
 
+            if (customerIds.length === 0) {
+                log.debug({ title: `${MODULE}.populateDestSublist`, details: 'No customers found to query open destination invoices.' });
+                return;
+            }
 
             const invoices = dao.getOpenInvoices(customerIds);
 
@@ -452,7 +485,7 @@ define([
                 sublist.setSublistValue({ id: 'custpage_dst_currency', line: index, value: inv.currencyText || '' });
             });
 
-            log.debug({ title: `${MODULE}.populateDestSublist`, details: `Populated ${invoices.length} destination lines` });
+            log.debug({ title: `${MODULE}.populateDestSublist`, details: `Populated ${invoices.length} destination lines for customers [${customerIds.join(',')}]` });
 
         } catch (e) {
             log.error({ title: `${MODULE}.populateDestSublist`, details: e.message || e });

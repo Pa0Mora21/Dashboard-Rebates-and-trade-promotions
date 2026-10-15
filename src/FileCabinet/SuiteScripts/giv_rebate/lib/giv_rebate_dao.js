@@ -47,6 +47,7 @@ define(['N/search', 'N/query', 'N/record', 'N/log'], (search, query, record, log
     /* Source Transaction */
     t.id                                              AS invoice_id,
     t.tranid                                          AS invoice_number,
+    t.entity                                          AS customer_id,
 
     /* Item */
     rtd.custrecord_rm_rebate_item                     AS item_id,
@@ -210,9 +211,11 @@ WHERE rtd.isinactive = 'F'
                 }
             }
 
-            // Filtro por cliente/pagador (campo custrecord_hidden_payer del acuerdo)
+            // Filtro por cliente/subcliente (cliente de la factura origen t.entity o pagador del acuerdo ag.custrecord_hidden_payer)
             if (filters.customerIds && filters.customerIds.length > 0) {
-                sql += ` AND ag.custrecord_hidden_payer IN (${filters.customerIds.map(() => '?').join(',')})`;
+                const custPlaceholders = filters.customerIds.map(() => '?').join(',');
+                sql += ` AND (t.entity IN (${custPlaceholders}) OR ag.custrecord_hidden_payer IN (${custPlaceholders}))`;
+                filters.customerIds.forEach(id => params.push(id));
                 filters.customerIds.forEach(id => params.push(id));
             }
 
@@ -300,6 +303,7 @@ WHERE rtd.isinactive = 'F'
                         accrualDate:      row.accrual_date     || '',
                         invoiceNumber:    row.invoice_number   || 'N/A',
                         invoiceId:        String(row.invoice_id || ''),
+                        customerId:       String(row.customer_id || ''),
                         itemId:           String(row.item_id   || ''),
                         itemText:         row.item_name        || (row.item_id ? String(row.item_id) : 'N/A'),
                         settlementMethod: String(row.settlement_method || ''),
@@ -574,6 +578,8 @@ WHERE rtd.isinactive = 'F'
                     search.createColumn({ name: 'tranid' }),
                     search.createColumn({ name: 'entity' }),
                     search.createColumn({ name: 'trandate', sort: search.Sort.DESC }),
+                    search.createColumn({ name: 'fxamount' }),
+                    search.createColumn({ name: 'fxamountremaining' }),
                     search.createColumn({ name: 'total' }),
                     search.createColumn({ name: 'amountremaining' }),
                     search.createColumn({ name: 'currency' })
@@ -582,7 +588,12 @@ WHERE rtd.isinactive = 'F'
 
             const results = [];
             invoiceSearch.run().each((result) => {
-                const amountRemaining = parseFloat(result.getValue('amountremaining')) || 0;
+                const amountRemaining = parseFloat(result.getValue('fxamountremaining'))
+                    || parseFloat(result.getValue('amountremaining'))
+                    || 0;
+                const totalAmount = parseFloat(result.getValue('fxamount'))
+                    || parseFloat(result.getValue('total'))
+                    || 0;
 
                 // Post-filtro JS: segunda capa de protección ante redondeos del motor de búsqueda
                 if (amountRemaining < MIN_BALANCE) {
@@ -599,7 +610,7 @@ WHERE rtd.isinactive = 'F'
                     customerId:      result.getValue('entity'),
                     customerText:    result.getText('entity'),
                     date:            result.getValue('trandate'),
-                    total:           parseFloat(result.getValue('total')) || 0,
+                    total:           totalAmount,
                     amountRemaining: amountRemaining,
                     currency:        result.getValue('currency'),
                     currencyText:    result.getText('currency')
