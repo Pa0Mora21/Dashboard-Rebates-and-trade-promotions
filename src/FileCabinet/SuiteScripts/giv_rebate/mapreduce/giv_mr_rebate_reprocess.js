@@ -3,24 +3,66 @@
  * @NScriptType MapReduceScript
  * @NModuleScope SameAccount
  * @description Reprocesamiento masivo de provisiones de Rebates.
- *              Aplica el recálculo nativo de Rebates al actualizar la tasa del acuerdo,
- *              resuelve el versionamiento de RADs (RAD padre -> RAD activo hoja)
- *              y actualiza tanto las líneas (custcol_rm_selecrebid) como la cabecera
- *              (custbody_rm_rebate_agg_detail_ids) para sincronizar automáticamente
- *              el motor nativo R&TP sin requerir acción manual en "View Applicable Rebates".
+ *              1. Resuelve el árbol de versiones de RADs (RAD padre -> RAD activo más reciente).
+ *              2. Protege las líneas cuyos Rebate Transactions (RT) ya tienen liquidación (Claim / Pro Forma).
+ *              3. Recalcula y actualiza directamente en la factura los 8 campos de línea y los 3 de cabecera,
+ *                 además de recuperar líneas cuyos JSONs hayan sido limpiados previamente.
+ *              4. Vacía custcol_rm_rebate_rcrd_link en las líneas modificadas y elimina en cascada
+ *                 (Accrual -> RTD -> RT) los registros auxiliares anteriores usando custrecord_rm_rebatetran.
+ *              5. En summarize, dispara customscript_rm_mr_rebate_transactions (customdeploy_rm_mr_rebate_transactions1)
+ *                 con custscript_rm_submitted_invid para recrear los RT y RTD con los nuevos montos.
  */
 define([
     'N/search',
     'N/record',
     'N/runtime',
     'N/task',
+    'N/query',
     'N/log'
-], (search, record, runtime, task, log) => {
+], (search, record, runtime, task, query, log) => {
 
     const MODULE = 'giv_mr_rebate_reprocess';
 
+    // Caché en memoria por instancia para no repetir la búsqueda de RADs en cada ejecución de map()
+    let cachedAgreementId = null;
+    let cachedRadDetails = null;
+
     /**
-     * Búsqueda de facturas únicas a reprocesar en el rango de fechas
+     * Verifica de forma ligera si una línea de factura contiene al menos un RAD perteneciente al acuerdo.
+     */
+    const lineContainsAgreementRad = (radIdSet, txnRebatesRaw, selectedRebatesRaw, selecRebIdRaw, applicableRadRaw) => {
+        if (!radIdSet || radIdSet.size === 0) return false;
+
+        const checkJsonStr = (rawStr) => {
+            if (!rawStr) return false;
+            try {
+                const parsed = JSON.parse(rawStr);
+                if (Array.isArray(parsed)) {
+                    return parsed.some(item => item && item.id !== undefined && radIdSet.has(String(item.id)));
+                }
+            } catch (e) { /* ignore parse errors */ }
+            return false;
+        };
+
+        if (checkJsonStr(txnRebatesRaw) || checkJsonStr(selectedRebatesRaw)) {
+            return true;
+        }
+
+        const csvRaw = selecRebIdRaw || applicableRadRaw;
+        if (csvRaw) {
+            const parts = String(csvRaw).split(',').map(s => s.trim()).filter(Boolean);
+            if (parts.some(idStr => radIdSet.has(idStr))) {
+                return true;
+            }
+        }
+
+        return false;
+    };
+
+    /**
+     * Búsqueda de facturas únicas a reprocesar en el rango de fechas.
+     * Pre-filtra a nivel línea únicamente las facturas que contienen al menos un RAD del acuerdo objetivo,
+     * evitando cargar en map() facturas que no pertenecen al acuerdo.
      */
     const getInputData = () => {
         try {
@@ -34,24 +76,73 @@ define([
                 details: `Acuerdo: ${agreementId} | Rango: ${dateFrom} al ${dateTo}`
             });
 
-            // Búsqueda directa de Facturas ÚNICAS (Mainline = T) para evitar duplicados
-            const invSearch = search.create({
+            const radDetails = getAgreementRadDetails(agreementId);
+            const radIdSet = new Set(Object.keys(radDetails));
+            if (radIdSet.size === 0) {
+                log.audit({
+                    title: `${MODULE}.getInputData | SIN REGLAS RAD`,
+                    details: `El acuerdo ${agreementId} no tiene RADs asociados.`
+                });
+                return [];
+            }
+
+            const lineSearch = search.create({
                 type: search.Type.INVOICE,
                 filters: [
-                    ['mainline', 'is', 'T'],
+                    ['mainline', 'is', 'F'],
+                    'AND', ['taxline', 'is', 'F'],
                     'AND', ['trandate', 'within', dateFrom, dateTo],
                     'AND', ['status', 'noneof', 'CustInvc:V']
                 ],
-                columns: ['internalid', 'tranid', 'trandate']
+                columns: [
+                    'internalid',
+                    'tranid',
+                    'trandate',
+                    'custcol_rm_applicable_txn_rebates',
+                    'custcol_rm_selected_rebates',
+                    'custcol_rm_selecrebid',
+                    'custcol_rm_applicable_rad'
+                ]
             });
 
-            const invCount = invSearch.runPaged().count;
+            const eligibleInvoicesMap = new Map();
+            const scannedInvoicesSet = new Set();
+            const pagedData = lineSearch.runPaged({ pageSize: 1000 });
+
+            pagedData.pageRanges.forEach((pageRange) => {
+                const page = pagedData.fetch({ index: pageRange.index });
+                page.data.forEach((row) => {
+                    const invId = String(row.id);
+                    scannedInvoicesSet.add(invId);
+                    if (eligibleInvoicesMap.has(invId)) return;
+
+                    const hasTargetRad = lineContainsAgreementRad(
+                        radIdSet,
+                        row.getValue('custcol_rm_applicable_txn_rebates'),
+                        row.getValue('custcol_rm_selected_rebates'),
+                        row.getValue('custcol_rm_selecrebid'),
+                        row.getValue('custcol_rm_applicable_rad')
+                    );
+
+                    if (hasTargetRad) {
+                        eligibleInvoicesMap.set(invId, {
+                            id: invId,
+                            values: {
+                                tranid: row.getValue('tranid'),
+                                trandate: row.getValue('trandate')
+                            }
+                        });
+                    }
+                });
+            });
+
+            const eligibleInvoices = Array.from(eligibleInvoicesMap.values());
             log.audit({
                 title: `${MODULE}.getInputData | FACTURAS ÚNICAS ENCONTRADAS`,
-                details: `Se encontraron ${invCount} Facturas únicas para procesar.`
+                details: `Se encontraron ${eligibleInvoices.length} Facturas con el acuerdo (de ${scannedInvoicesSet.size} facturas en el rango) para procesar.`
             });
 
-            return invSearch;
+            return eligibleInvoices;
 
         } catch (e) {
             log.error({ title: `${MODULE}.getInputData | ERROR`, details: e.message });
@@ -60,26 +151,32 @@ define([
     };
 
     /**
-     * Consulta las reglas de cálculo (tasa y método) para los RADs del acuerdo modificado.
-     * Agrupa todos los RADs por su raíz común (custrecord_rm_rad_parent) y asigna
-     * la regla de la versión activa más reciente (MAX internalid) a todos los miembros de la familia.
+     * Consulta las reglas de cálculo (tasa, método y pass-through) para todos los RADs del acuerdo.
+     * Agrupa todos los RADs (incluyendo padres inactivos) por su raíz común (custrecord_rm_rad_parent)
+     * y asigna la regla de la versión activa más reciente (MAX internalid) a todos los miembros de la familia.
      */
     const getAgreementRadDetails = (agreementId) => {
         const radMap = {};
         if (!agreementId) return radMap;
 
+        if (cachedAgreementId === String(agreementId) && cachedRadDetails) {
+            return cachedRadDetails;
+        }
+
         try {
             const radSearch = search.create({
                 type: 'customrecord_rebate_agreement_details',
                 filters: [
-                    ['custrecord_rm_rebate_agreement', 'anyof', agreementId],
-                    'AND', ['isinactive', 'is', 'F']
+                    ['custrecord_rm_rebate_agreement', 'anyof', agreementId]
                 ],
                 columns: [
                     'internalid',
+                    'isinactive',
                     'custrecord_aggr_detail_cal_amount',
                     'custrecord_agreementdetail_cal_method',
-                    'custrecord_rm_rad_parent'
+                    'custrecord_rm_rad_parent',
+                    'custrecord_agreementdetail_passthrough',
+                    'custrecord_detail_price_pass_value'
                 ]
             });
 
@@ -87,22 +184,27 @@ define([
 
             radSearch.run().each((result) => {
                 const radId = String(result.id);
+                const isInactive = result.getValue('isinactive') === true || result.getValue('isinactive') === 'T';
                 const parentRadVal = result.getValue('custrecord_rm_rad_parent');
                 const parentRad = parentRadVal ? String(parentRadVal) : null;
                 const calcAmount = parseFloat(result.getValue('custrecord_aggr_detail_cal_amount')) || 0;
                 const calcMethod = result.getText('custrecord_agreementdetail_cal_method') || result.getValue('custrecord_agreementdetail_cal_method') || '';
+                const passThroughType = result.getText('custrecord_agreementdetail_passthrough') || '';
+                const passThroughVal = parseFloat(result.getValue('custrecord_detail_price_pass_value')) || 0;
 
                 allRads[radId] = {
                     id: radId,
+                    isInactive: isInactive,
                     parentId: parentRad,
                     calcAmount: calcAmount,
-                    calcMethod: calcMethod
+                    calcMethod: calcMethod,
+                    passThroughType: passThroughType,
+                    passThroughVal: passThroughVal
                 };
 
                 return true;
             });
 
-            // Función para resolver el RAD raíz de cualquier RAD cargado
             const getRootId = (id) => {
                 let curr = id;
                 const visited = new Set();
@@ -113,7 +215,6 @@ define([
                 return curr;
             };
 
-            // Agrupar los RADs por su raíz común (familia de versiones)
             const families = {};
             for (const radId in allRads) {
                 const rootId = getRootId(radId);
@@ -123,31 +224,35 @@ define([
                 families[rootId].push(allRads[radId]);
             }
 
-            // Para cada familia de versiones, encontrar la versión activa más reciente (MAX internalid)
             for (const rootId in families) {
                 const familyMembers = families[rootId];
-                let latestRad = familyMembers[0];
+                // Preferir miembros activos al buscar el más reciente
+                const activeMembers = familyMembers.filter(m => !m.isInactive);
+                const candidates = activeMembers.length > 0 ? activeMembers : familyMembers;
 
-                for (let i = 1; i < familyMembers.length; i++) {
-                    if (parseInt(familyMembers[i].id, 10) > parseInt(latestRad.id, 10)) {
-                        latestRad = familyMembers[i];
+                let latestRad = candidates[0];
+                for (let i = 1; i < candidates.length; i++) {
+                    if (parseInt(candidates[i].id, 10) > parseInt(latestRad.id, 10)) {
+                        latestRad = candidates[i];
                     }
                 }
 
                 const familyRule = {
                     newRadId: latestRad.id,
                     calcAmount: latestRad.calcAmount,
-                    calcMethod: latestRad.calcMethod
+                    calcMethod: latestRad.calcMethod,
+                    passThroughType: latestRad.passThroughType,
+                    passThroughVal: latestRad.passThroughVal
                 };
 
-                // Asignar la regla más reciente a TODOS los miembros de la familia
                 familyMembers.forEach((member) => {
                     radMap[member.id] = familyRule;
                 });
-
-                // Mapear también la raíz explícitamente
                 radMap[rootId] = familyRule;
             }
+
+            cachedAgreementId = String(agreementId);
+            cachedRadDetails = radMap;
 
             log.audit({
                 title: `${MODULE}.getAgreementRadDetails | REGLAS CARGADAS`,
@@ -162,124 +267,276 @@ define([
     };
 
     /**
-     * Carga la factura, recalcula los valores según la regla del acuerdo modificado,
-     * setea los valores en las líneas, actualiza la cabecera y guarda en 1 solo paso.
+     * Obtiene los IDs de Rebate Transactions (customrecord_rm_transactions) asociados a la factura
+     * que ya tienen una liquidación (Claim) o Pro Forma generada, replicando populateClaimedRTs de RM_CS_RebateAccrual.
+     */
+    const getClaimedRtIds = (invoiceId) => {
+        const claimedSet = new Set();
+        if (!invoiceId) return claimedSet;
+
+        try {
+            const sql = `
+                SELECT DISTINCT rt.id AS id
+                FROM customrecord_rm_transactions rt,
+                     customrecord_rm_transaction_details rtd
+                WHERE rt.custrecord_rm_rebate_transaction = ?
+                  AND (rtd.custrecord_rm_rtd_claim IS NOT NULL OR rtd.custrecord_rm_rtd_pro_forma_rec IS NOT NULL)
+                  AND rtd.custrecord_rm_rebatetran = rt.id
+            `;
+            const results = query.runSuiteQL({
+                query: sql,
+                params: [invoiceId]
+            }).asMappedResults();
+
+            results.forEach((row) => {
+                if (row.id) {
+                    claimedSet.add(Number(row.id));
+                }
+            });
+        } catch (e) {
+            log.error({ title: `${MODULE}.getClaimedRtIds | ERROR`, details: `Factura ID ${invoiceId}: ${e.message}` });
+        }
+
+        return claimedSet;
+    };
+
+    /**
+     * Carga la factura, recalcula los 8 campos de línea y los 3 de cabecera con la nueva regla del acuerdo,
+     * limpia custcol_rm_rebate_rcrd_link, borra en cascada los registros viejos (Accrual -> RTD -> RT) y guarda.
      */
     const map = (context) => {
+        const searchResult = JSON.parse(context.value);
         try {
-            const searchResult = JSON.parse(context.value);
-            log.debug({ title: `${MODULE}.map | SEARCH RESULT`, details: searchResult });
             const vals = searchResult.values || {};
-
-            let invoiceId = searchResult.id;
-            let tranId = 'N/A';
-
-            const joinId = vals['internalid.custrecord_rm_source_transaction'] || vals['custrecord_rm_source_transaction.internalid'];
-            const joinTranId = vals['tranid.custrecord_rm_source_transaction'] || vals['custrecord_rm_source_transaction.tranid'];
-
-            if (joinId) invoiceId = joinId.value || joinId;
-            if (joinTranId) {
-                tranId = joinTranId.value || joinTranId;
-            } else if (vals.tranid) {
-                tranId = vals.tranid.value || vals.tranid;
-            }
+            const invoiceId = searchResult.id;
+            const tranId = vals.tranid ? (vals.tranid.value || vals.tranid) : 'N/A';
 
             if (!invoiceId) return;
 
             const script = runtime.getCurrentScript();
             const agreementId = script.getParameter({ name: 'custscript_giv_reproc_agreement' });
 
-            // Obtener reglas del acuerdo modificado (RADs) resolviendo versiones por familias
             const radDetails = getAgreementRadDetails(agreementId);
-            log.debug({ title: `${MODULE}.map | REGLAS ACUERDO`, details: JSON.stringify(radDetails) });
 
-            // Cargar la factura en modo estándar (isDynamic: false) para preservar las opciones de artículos (item options) de las líneas
+            // Consulta perezosa (lazy) de RTs liquidados: solo se ejecuta cuando realmente se requiere
+            let claimedRtIds = null;
+            const ensureClaimedRtIds = () => {
+                if (!claimedRtIds) {
+                    claimedRtIds = getClaimedRtIds(invoiceId);
+                    if (claimedRtIds.size > 0) {
+                        log.audit({
+                            title: `${MODULE}.map | RTs LIQUIDADOS DETECTADOS`,
+                            details: `Factura ID ${invoiceId} tiene RTs liquidados que no se modificarán: ${Array.from(claimedRtIds).join(', ')}`
+                        });
+                    }
+                }
+                return claimedRtIds;
+            };
+
             const invoiceRec = record.load({
                 type: record.Type.INVOICE,
                 id: invoiceId,
                 isDynamic: false
             });
 
-            const docNumber = invoiceRec.getValue({ fieldId: 'tranid' }) || tranId || 'N/A';
+            const docNumber = invoiceRec.getValue({ fieldId: 'tranid' }) || tranId;
             const lineCount = invoiceRec.getLineCount({ sublistId: 'item' });
-            let headerTotalImpact = 0;
 
-            // Conjunto de todos los RAD IDs aplicables a nivel de cabecera de la factura
+            let headerTotalImpact = 0;
+            let headerTotalEstGrossProfit = 0;
+            let headerTotalAdjustedSaleAmt = 0;
             const headerRadIdsSet = new Set();
-            const hiddenRebateTranFields = [];
-            invoiceRec.setValue({ fieldId: 'custbody_rm_rebate_calc_status', value: 'Pending' });
+            let linesUpdatedCount = 0;
 
             for (let i = 0; i < lineCount; i++) {
                 const lineItemId = invoiceRec.getSublistValue({ sublistId: 'item', fieldId: 'item', line: i });
                 const lineAmount = parseFloat(invoiceRec.getSublistValue({ sublistId: 'item', fieldId: 'amount', line: i }) || 0);
                 const lineQty = parseFloat(invoiceRec.getSublistValue({ sublistId: 'item', fieldId: 'quantity', line: i }) || 0);
                 const rateVal = parseFloat(invoiceRec.getSublistValue({ sublistId: 'item', fieldId: 'rate', line: i }) || 0);
+                const costEstimate = parseFloat(invoiceRec.getSublistValue({ sublistId: 'item', fieldId: 'costestimate', line: i }) || 0);
+                const estGrossProfitVal = parseFloat(invoiceRec.getSublistValue({ sublistId: 'item', fieldId: 'estgrossprofit', line: i }));
+                const lineEstGrossProfit = isNaN(estGrossProfitVal) ? (lineAmount - costEstimate) : estGrossProfitVal;
 
                 const existingRtLink = invoiceRec.getSublistValue({ sublistId: 'item', fieldId: 'custcol_rm_rebate_rcrd_link', line: i });
-                if (existingRtLink) {
-                    hiddenRebateTranFields.push(String(existingRtLink));
-                }
-
                 const txnRebatesRaw = invoiceRec.getSublistValue({ sublistId: 'item', fieldId: 'custcol_rm_applicable_txn_rebates', line: i });
+                const selectedRebatesRaw = invoiceRec.getSublistValue({ sublistId: 'item', fieldId: 'custcol_rm_selected_rebates', line: i });
                 const hiddenRmaRaw = invoiceRec.getSublistValue({ sublistId: 'item', fieldId: 'custcol_rm_so_hidden_rma', line: i });
                 const hiddenItemObjRaw = invoiceRec.getSublistValue({ sublistId: 'item', fieldId: 'custcol_rm_so_hidden_item_obj', line: i });
+                const selecRebIdRaw = invoiceRec.getSublistValue({ sublistId: 'item', fieldId: 'custcol_rm_selecrebid', line: i }) ||
+                                      invoiceRec.getSublistValue({ sublistId: 'item', fieldId: 'custcol_rm_applicable_rad', line: i });
 
                 let txnRebates = [];
+                let selectedRebates = [];
                 let hiddenRma = { bo: 0, l: 0, p: 0, c: 1, rad: [] };
                 let hiddenItemObj = { ac: 0, id: Number(lineItemId) || 0, lp: rateVal, md: 0, pv: 0, tp: lineAmount, pp: 0 };
 
                 try { if (txnRebatesRaw) txnRebates = JSON.parse(txnRebatesRaw); } catch (e) { }
+                try { if (selectedRebatesRaw) selectedRebates = JSON.parse(selectedRebatesRaw); } catch (e) { }
                 try { if (hiddenRmaRaw) hiddenRma = JSON.parse(hiddenRmaRaw); } catch (e) { }
                 try { if (hiddenItemObjRaw) hiddenItemObj = JSON.parse(hiddenItemObjRaw); } catch (e) { }
                 if (!hiddenItemObj.id || hiddenItemObj.id === 0) {
                     hiddenItemObj.id = Number(lineItemId) || 0;
                 }
 
-                // RE CÁLCULO: Aplicar la nueva tasa/monto del acuerdo modificado
+                // Si selectedRebates conserva más RADs únicos que txnRebates (ej. si txnRebates fue colapsado en corrida previa), restaurar desde selectedRebates
+                let restoredFromSelected = false;
+                if (Array.isArray(selectedRebates) && selectedRebates.length > 0) {
+                    const uniqueTxnIds = new Set(txnRebates.map(r => String(r.id)));
+                    const uniqueSelIds = new Set(selectedRebates.map(r => String(r.id)));
+                    if (uniqueSelIds.size > uniqueTxnIds.size) {
+                        txnRebates = JSON.parse(JSON.stringify(selectedRebates));
+                        restoredFromSelected = true;
+                    }
+                }
+
+                // Si txnRebates estaba vacío (ej. limpiado en corrida previa), reconstruirlo desde custcol_rm_selecrebid
+                if (txnRebates.length === 0 && selecRebIdRaw) {
+                    String(selecRebIdRaw).split(',').map(s => s.trim()).filter(Boolean).forEach((radIdStr) => {
+                        txnRebates.push({ id: isNaN(Number(radIdStr)) ? radIdStr : Number(radIdStr), a: 0, p: 0 });
+                    });
+                    restoredFromSelected = true;
+                }
+
+                const existingAccrual = parseFloat(invoiceRec.getSublistValue({ sublistId: 'item', fieldId: 'custcol_rm_accrual_amount', line: i }) || 0);
+                const existingAdjSale = parseFloat(invoiceRec.getSublistValue({ sublistId: 'item', fieldId: 'custcol_rm_adjustedsaleamount', line: i }) || lineAmount);
+                const existingPptAmount = parseFloat(invoiceRec.getSublistValue({ sublistId: 'item', fieldId: 'custcol_rm_pricepassthrough', line: i }) || 0);
+
+                // Si la línea tiene un RT ya liquidado (Claim/Proforma), conservar sus valores intactos
+                if (existingRtLink && ensureClaimedRtIds().has(Number(existingRtLink))) {
+                    headerTotalImpact += existingAccrual;
+                    headerTotalEstGrossProfit += lineEstGrossProfit;
+                    headerTotalAdjustedSaleAmt += existingAdjSale;
+                    txnRebates.forEach((item) => { if (item.id) headerRadIdsSet.add(item.id); });
+                    log.audit({
+                        title: `${MODULE}.map | LÍNEA PROTEGIDA POR CLAIM`,
+                        details: `Factura ID ${invoiceId} | Línea ${i + 1} | RT ID: ${existingRtLink}`
+                    });
+                    continue;
+                }
+
+                // Si no hay ningún rebate aplicable en la línea, continuar
+                if (txnRebates.length === 0) {
+                    headerTotalEstGrossProfit += lineEstGrossProfit;
+                    headerTotalAdjustedSaleAmt += lineAmount;
+                    continue;
+                }
+
+                let linePptAmount = existingPptAmount;
+                let lineHasTargetAgreement = false;
+                let lineHasActualChanges = restoredFromSelected || !existingRtLink;
+
+                // RECÁLCULO: Actualizar ÚNICAMENTE el rebate que pertenece al acuerdo modificado, conservando intactos los demás rebates de la línea
                 txnRebates.forEach((item) => {
                     const oldRadId = String(item.id);
-                    if (radDetails[oldRadId]) {
-                        const rule = radDetails[oldRadId];
-                        log.debug({
-                            title: `${MODULE}.map | RE-CÁLCULO RAD`,
-                            details: `Línea ${i + 1} | RAD ID Viejo: ${oldRadId} | Nuevo RAD ID: ${rule.newRadId} | Regla: ${JSON.stringify(rule)}`
-                        });
+                    const oldItemA = parseFloat(item.a) || 0;
+                    const oldItemP = parseFloat(item.p) || 0;
+                    const rule = radDetails[oldRadId];
 
-                        // Actualizar al nuevo RAD ID (ej. de 141 a 142)
-                        if (rule.newRadId) {
-                            item.id = isNaN(Number(rule.newRadId)) ? rule.newRadId : Number(rule.newRadId);
+                    if (rule) {
+                        lineHasTargetAgreement = true;
+                        const targetRadId = rule.newRadId
+                            ? (isNaN(Number(rule.newRadId)) ? rule.newRadId : Number(rule.newRadId))
+                            : item.id;
+
+                        // Calcular Price Pass-Through si está configurado en la regla
+                        if (rule.passThroughVal > 0) {
+                            if (String(rule.passThroughType).includes('%')) {
+                                linePptAmount = Math.abs(lineAmount * (rule.passThroughVal / 100));
+                            } else {
+                                linePptAmount = Math.abs(lineQty * rule.passThroughVal);
+                            }
                         }
+
+                        const calcBaseAmount = lineAmount - linePptAmount;
+                        let newItemA = oldItemA;
+                        let newItemP = oldItemP;
 
                         if (String(rule.calcMethod).includes('%')) {
-                            // Porcentaje: -1 * (monto_línea * (porcentaje / 100))
-                            item.a = -1 * Math.abs(lineAmount * (rule.calcAmount / 100));
-                            item.p = rule.calcAmount;
+                            newItemA = -1 * Math.abs(calcBaseAmount * (rule.calcAmount / 100));
+                            newItemP = rule.calcAmount;
                         } else {
-                            // Monto fijo por unidad: -1 * (cantidad_línea * monto_fijo)
-                            item.a = -1 * Math.abs(lineQty * rule.calcAmount);
-                            item.p = 0;
+                            newItemA = -1 * Math.abs(lineQty * rule.calcAmount);
+                            newItemP = 0;
                         }
+
+                        // Verificar si cambió el RAD ID, el monto, el porcentaje o el Price Pass-Through
+                        if (
+                            String(item.id) !== String(targetRadId) ||
+                            Math.abs(oldItemA - newItemA) > 0.005 ||
+                            Math.abs(oldItemP - newItemP) > 0.0001 ||
+                            Math.abs(existingPptAmount - linePptAmount) > 0.005
+                        ) {
+                            lineHasActualChanges = true;
+                        }
+
+                        item.id = targetRadId;
+                        item.a = newItemA;
+                        item.p = newItemP;
                     }
 
-                    // Acumular RAD IDs para la cabecera
-                    headerRadIdsSet.add(item.id);
+                    if (item.id) {
+                        headerRadIdsSet.add(item.id);
+                    }
                 });
-                const newAccrualAmount = txnRebates.reduce((sum, item) => sum + (parseFloat(item.a) || 0), 0);
-                headerTotalImpact += newAccrualAmount;
 
-                hiddenRma.rad = txnRebates.map(r => ({ id: r.id, a: r.a, p: r.p || 0 }));
-                hiddenRma.bo = newAccrualAmount;
+                const newAccrualAmount = txnRebates.reduce((sum, item) => sum + (parseFloat(item.a) || 0), 0);
+                if (lineHasTargetAgreement && Math.abs(existingAccrual - newAccrualAmount) > 0.005) {
+                    lineHasActualChanges = true;
+                }
+
+                // Si esta línea no tiene ningún RAD del acuerdo reprocesado, o si sus valores no cambiaron en absoluto, conservarla sin tocar su RT
+                if (!lineHasTargetAgreement || !lineHasActualChanges) {
+                    if (existingRtLink) {
+                        ensureClaimedRtIds().add(Number(existingRtLink));
+                    }
+                    headerTotalImpact += existingAccrual;
+                    headerTotalEstGrossProfit += lineEstGrossProfit;
+                    headerTotalAdjustedSaleAmt += existingAdjSale;
+                    continue;
+                }
+
+                // Vaciar custcol_rm_rebate_rcrd_link en la línea para que R&TP genere el nuevo RT
+                if (existingRtLink) {
+                    invoiceRec.setSublistValue({
+                        sublistId: 'item',
+                        fieldId: 'custcol_rm_rebate_rcrd_link',
+                        line: i,
+                        value: ''
+                    });
+                }
+
+                const adjustedSaleAmount = lineAmount - linePptAmount;
+                const gpAfterRebate = lineEstGrossProfit + newAccrualAmount;
+                const gpPctAfterRebate = adjustedSaleAmount !== 0 ? (gpAfterRebate / adjustedSaleAmount) * 100 : 0;
+                const adjustedUnitCost = lineQty > 0 ? (costEstimate - newAccrualAmount) / lineQty : 0;
+
+                headerTotalImpact += newAccrualAmount;
+                headerTotalEstGrossProfit += lineEstGrossProfit;
+                headerTotalAdjustedSaleAmt += adjustedSaleAmount;
+
+                hiddenRma.rad = txnRebates.map(r => ({ id: r.id, a: parseFloat(Number(r.a).toFixed(2)), p: r.p || 0 }));
+                hiddenRma.bo = parseFloat(newAccrualAmount.toFixed(2));
+                hiddenRma.p = parseFloat(linePptAmount.toFixed(2));
                 hiddenItemObj.tp = lineAmount;
 
-                // SETEAR DIRECTAMENTE EN LA LÍNEA (ESTÁNDAR)
+                // 1. JSONs de View Applicable Rebates (manteniendo todos los rebates de la línea)
+                const updatedTxnRebatesJson = JSON.stringify(txnRebates);
                 invoiceRec.setSublistValue({
                     sublistId: 'item',
                     fieldId: 'custcol_rm_applicable_txn_rebates',
                     line: i,
-                    value: JSON.stringify(txnRebates)
+                    value: updatedTxnRebatesJson
                 });
 
-                // Actualizar custcol_rm_applicable_rad y custcol_rm_selecrebid con las nuevas versiones de RAD
+                try {
+                    invoiceRec.setSublistValue({
+                        sublistId: 'item',
+                        fieldId: 'custcol_rm_selected_rebates',
+                        line: i,
+                        value: updatedTxnRebatesJson
+                    });
+                } catch (eSel) { }
+
                 const updatedApplicableRads = txnRebates.map(r => r.id).join(',');
                 invoiceRec.setSublistValue({
                     sublistId: 'item',
@@ -297,13 +554,6 @@ define([
 
                 invoiceRec.setSublistValue({
                     sublistId: 'item',
-                    fieldId: 'custcol_rm_accrual_amount',
-                    line: i,
-                    value: parseFloat(newAccrualAmount.toFixed(2))
-                });
-
-                invoiceRec.setSublistValue({
-                    sublistId: 'item',
                     fieldId: 'custcol_rm_so_hidden_rma',
                     line: i,
                     value: JSON.stringify(hiddenRma)
@@ -316,12 +566,54 @@ define([
                     value: JSON.stringify(hiddenItemObj)
                 });
 
-                // Activar bandera nativa para que afterSubmit de R&TP reconozca la línea modificada
+                // 2. Los 7 campos numéricos visibles de la línea
                 invoiceRec.setSublistValue({
                     sublistId: 'item',
-                    fieldId: 'custcol_rm_rebselection',
+                    fieldId: 'custcol_rm_accrual_amount',
                     line: i,
-                    value: true
+                    value: parseFloat(newAccrualAmount.toFixed(2))
+                });
+
+                invoiceRec.setSublistValue({
+                    sublistId: 'item',
+                    fieldId: 'custcol_rm_actual_gross_amount',
+                    line: i,
+                    value: parseFloat(lineAmount.toFixed(2))
+                });
+
+                invoiceRec.setSublistValue({
+                    sublistId: 'item',
+                    fieldId: 'custcol_rm_pricepassthrough',
+                    line: i,
+                    value: parseFloat(linePptAmount.toFixed(2))
+                });
+
+                invoiceRec.setSublistValue({
+                    sublistId: 'item',
+                    fieldId: 'custcol_rm_adjustedsaleamount',
+                    line: i,
+                    value: parseFloat(adjustedSaleAmount.toFixed(2))
+                });
+
+                invoiceRec.setSublistValue({
+                    sublistId: 'item',
+                    fieldId: 'custcol_rm_adjustedunitcost',
+                    line: i,
+                    value: parseFloat(adjustedUnitCost.toFixed(2))
+                });
+
+                invoiceRec.setSublistValue({
+                    sublistId: 'item',
+                    fieldId: 'custcol_rm_gp_amount_aftr_rebate',
+                    line: i,
+                    value: parseFloat(gpAfterRebate.toFixed(2))
+                });
+
+                invoiceRec.setSublistValue({
+                    sublistId: 'item',
+                    fieldId: 'custcol_rm_gp_per_after_rebat',
+                    line: i,
+                    value: parseFloat(gpPctAfterRebate.toFixed(2))
                 });
 
                 invoiceRec.setSublistValue({
@@ -330,48 +622,20 @@ define([
                     line: i,
                     value: new Date()
                 });
+
+                linesUpdatedCount++;
             }
 
-            // Eliminar explícitamente en cascada (Accruals -> RTD -> RT) todos los registros de rebate viejos para esta factura
+            if (linesUpdatedCount === 0) {
+                log.audit({
+                    title: `${MODULE}.map | FACTURA OMITIDA`,
+                    details: `Factura ${docNumber} (ID: ${invoiceId}) no tiene líneas elegibles para actualizar.`
+                });
+                return;
+            }
+
+            // Eliminar en cascada (Accrual -> RTD -> RT) los registros de rebate viejos NO liquidados de esta factura
             try {
-                // 1. Eliminar RTD (Transaction Details) y sus Accruals vinculados buscando por custrecord_rm_source_transaction
-                try {
-                    const rtdSearch = search.create({
-                        type: 'customrecord_rm_transaction_details',
-                        filters: [
-                            ['custrecord_rm_source_transaction', 'anyof', invoiceId]
-                        ],
-                        columns: ['internalid', 'custrecord_rm_rtd_accrual']
-                    });
-
-                    rtdSearch.run().each((rtdRes) => {
-                        const rtdId = rtdRes.id;
-                        const accrualId = rtdRes.getValue('custrecord_rm_rtd_accrual');
-
-                        // 1a. Eliminar Accrual
-                        if (accrualId) {
-                            try {
-                                record.delete({ type: 'customrecord_rm_accruals', id: accrualId });
-                                log.audit({ title: `${MODULE}.map | ACCRUAL ELIMINADO`, details: `Accrual ID ${accrualId}` });
-                            } catch (eAcc) {
-                                log.debug({ title: `${MODULE}.map | ACCRUAL DELETE NOTE`, details: eAcc.message });
-                            }
-                        }
-
-                        // 1b. Eliminar RTD
-                        try {
-                            record.delete({ type: 'customrecord_rm_transaction_details', id: rtdId });
-                            log.audit({ title: `${MODULE}.map | RTD ELIMINADO`, details: `RTD ID ${rtdId}` });
-                        } catch (eRtd) {
-                            log.debug({ title: `${MODULE}.map | RTD DELETE NOTE`, details: eRtd.message });
-                        }
-                        return true;
-                    });
-                } catch (eRtdSearch) {
-                    log.debug({ title: `${MODULE}.map | RTD SEARCH NOTE`, details: eRtdSearch.message });
-                }
-
-                // 2. Buscar RTs por custrecord_rm_rebate_transaction = invoiceId
                 const rtSearch = search.create({
                     type: 'customrecord_rm_transactions',
                     filters: [
@@ -380,48 +644,183 @@ define([
                     columns: ['internalid']
                 });
 
+                const activeClaimedRtIds = ensureClaimedRtIds();
+                const unclaimedRtIds = [];
                 rtSearch.run().each((rtRes) => {
                     const rtId = rtRes.id;
-                    if (rtId) {
-                        hiddenRebateTranFields.push(String(rtId));
+                    if (rtId && !activeClaimedRtIds.has(Number(rtId))) {
+                        unclaimedRtIds.push(String(rtId));
                     }
-
-                    // 2a. Eliminar RT padre
-                    try {
-                        record.delete({ type: 'customrecord_rm_transactions', id: rtId });
-                        log.audit({ title: `${MODULE}.map | RT ELIMINADO DIRECTO`, details: `RT ID ${rtId} para Factura ID ${invoiceId}` });
-                    } catch (eRt) {
-                        log.debug({ title: `${MODULE}.map | RT DELETE NOTE`, details: eRt.message });
-                    }
-
                     return true;
                 });
+
+                if (unclaimedRtIds.length > 0) {
+                    const rtdIdsToDelete = [];
+                    const accrualIdsToProcess = new Set();
+
+                    try {
+                        const rtdSearch = search.create({
+                            type: 'customrecord_rm_transaction_details',
+                            filters: [
+                                ['custrecord_rm_rebatetran', 'anyof', unclaimedRtIds],
+                                'AND', ['custrecord_rm_rtd_claim', 'anyof', '@NONE@']
+                            ],
+                            columns: ['internalid', 'custrecord_rm_rtd_accrual']
+                        });
+
+                        rtdSearch.run().each((rtdRes) => {
+                            const rtdId = rtdRes.id;
+                            const accrualId = rtdRes.getValue('custrecord_rm_rtd_accrual');
+                            if (rtdId) rtdIdsToDelete.push(String(rtdId));
+                            if (accrualId) accrualIdsToProcess.add(String(accrualId));
+                            return true;
+                        });
+                    } catch (eRtdSearch) {
+                        log.debug({ title: `${MODULE}.map | RTD SEARCH NOTE`, details: eRtdSearch.message });
+                    }
+
+                    // 1. Reversar las pólizas contables (Journal Entries) de los Accruals ANTES de eliminar los Accruals
+                    //    (si se elimina primero el Accrual, NetSuite limpia custbody_rm_accrual_journal en el JE y se pierde el vínculo)
+                    if (accrualIdsToProcess.size > 0) {
+                        try {
+                            const jeSearch = search.create({
+                                type: 'journalentry',
+                                filters: [
+                                    ['mainline', 'is', 'T'],
+                                    'AND',
+                                    ['custbody_rm_accrual_journal', 'anyof', Array.from(accrualIdsToProcess)]
+                                ],
+                                columns: [
+                                    'internalid',
+                                    'tranid',
+                                    'custbody_rm_accrual_journal',
+                                    'custbody_rm_rebate_claim_journal'
+                                ]
+                            });
+
+                            const processedJeIds = new Set();
+                            jeSearch.run().each((jeRes) => {
+                                const jeId = String(jeRes.id);
+                                if (!jeId || processedJeIds.has(jeId)) return true;
+                                processedJeIds.add(jeId);
+
+                                const claimJnl = jeRes.getValue('custbody_rm_rebate_claim_journal');
+                                if (claimJnl) return true; // Ignorar JEs de liquidación/Claim
+
+                                const jeTranId = jeRes.getValue('tranid') || jeId;
+                                const linkedAccrualId = jeRes.getValue('custbody_rm_accrual_journal');
+
+                                try {
+                                    const jeRec = record.load({
+                                        type: 'journalentry',
+                                        id: jeId,
+                                        isDynamic: false
+                                    });
+                                    const existingRevDate = jeRec.getValue({ fieldId: 'reversaldate' });
+                                    const existingRevEntry = jeRec.getValue({ fieldId: 'reversalentry' });
+
+                                    if (!existingRevDate && !existingRevEntry) {
+                                        jeRec.setValue({
+                                            fieldId: 'reversaldate',
+                                            value: new Date()
+                                        });
+                                        jeRec.save({
+                                            enableSourcing: false,
+                                            ignoreMandatoryFields: true
+                                        });
+                                        log.audit({
+                                            title: `${MODULE}.map | JE DE ACCRUAL REVERSADO`,
+                                            details: `JE ${jeTranId} (ID: ${jeId}) reversado automáticamente con reversaldate hoy (Accrual ID: ${linkedAccrualId})`
+                                        });
+                                    } else {
+                                        log.debug({
+                                            title: `${MODULE}.map | JE YA REVERSADO`,
+                                            details: `JE ${jeTranId} (ID: ${jeId}) ya tenía reversa asignada (Reversal Entry: ${existingRevEntry || 'N/A'})`
+                                        });
+                                    }
+                                } catch (eJeRev) {
+                                    log.error({
+                                        title: `${MODULE}.map | ERROR REVERSANDO JE`,
+                                        details: `No se pudo reversar JE ${jeTranId} (ID: ${jeId}, Accrual: ${linkedAccrualId}): ${eJeRev.message}`
+                                    });
+                                }
+                                return true;
+                            });
+                        } catch (eJeSearch) {
+                            log.error({
+                                title: `${MODULE}.map | ERROR BUSCANDO JEs DE ACCRUAL`,
+                                details: eJeSearch.message
+                            });
+                        }
+
+                        // 2. Eliminar los registros de Accrual viejos
+                        accrualIdsToProcess.forEach((accrualId) => {
+                            try {
+                                record.delete({ type: 'customrecord_rm_accruals', id: accrualId });
+                                log.audit({ title: `${MODULE}.map | ACCRUAL ELIMINADO`, details: `Accrual ID ${accrualId}` });
+                            } catch (eAcc) {
+                                log.debug({ title: `${MODULE}.map | ACCRUAL DELETE NOTE`, details: eAcc.message });
+                            }
+                        });
+                    }
+
+                    // 3. Eliminar los registros RTD viejos
+                    rtdIdsToDelete.forEach((rtdId) => {
+                        try {
+                            record.delete({ type: 'customrecord_rm_transaction_details', id: rtdId });
+                            log.audit({ title: `${MODULE}.map | RTD ELIMINADO`, details: `RTD ID ${rtdId} (RT Padre: ${unclaimedRtIds.join(',')})` });
+                        } catch (eRtd) {
+                            log.debug({ title: `${MODULE}.map | RTD DELETE NOTE`, details: eRtd.message });
+                        }
+                    });
+
+                    // 4. Eliminar los registros RT viejos
+                    unclaimedRtIds.forEach((rtId) => {
+                        try {
+                            record.delete({ type: 'customrecord_rm_transactions', id: rtId });
+                            log.audit({ title: `${MODULE}.map | RT ELIMINADO DIRECTO`, details: `RT ID ${rtId} para Factura ID ${invoiceId}` });
+                        } catch (eRt) {
+                            log.debug({ title: `${MODULE}.map | RT DELETE NOTE`, details: eRt.message });
+                        }
+                    });
+                }
             } catch (eCascade) {
                 log.error({ title: `${MODULE}.map | ERROR BORRADO EN CASCADA`, details: eCascade.message });
             }
 
-            // Notificar a R&TP en cabecera para sincronizar el motor nativo
-            const existingRtIdsSet = new Set(hiddenRebateTranFields);
-            if (existingRtIdsSet.size > 0) {
-                const combinedHidden = Array.from(existingRtIdsSet).join(',');
-                invoiceRec.setValue({
-                    fieldId: 'custbody_hidden_rebate_tran_fields',
-                    value: combinedHidden
-                });
-                log.audit({
-                    title: `${MODULE}.map | RTs EN CABECERA`,
-                    details: `Factura ID ${invoiceId} | custbody_hidden_rebate_tran_fields: ${combinedHidden}`
-                });
-            }
+            // Actualizar los 3 campos de Rebate / Gross Profit en cabecera
+            const headerGpAfterRebate = headerTotalEstGrossProfit + headerTotalImpact;
+            const headerGpPctAfterRebate = headerTotalAdjustedSaleAmt !== 0
+                ? (headerGpAfterRebate / headerTotalAdjustedSaleAmt) * 100
+                : 0;
 
-            // Establecer estados en 'Pending' para notificar al motor nativo de R&TP que requiere procesamiento de borrado/cálcul
-
-
-            // Actualizar impacto total consolidado en la cabecera
             invoiceRec.setValue({
                 fieldId: 'custbody_rm_rebate_impact_so',
-                value: headerTotalImpact
+                value: parseFloat(headerTotalImpact.toFixed(2))
             });
+
+            try {
+                invoiceRec.setValue({
+                    fieldId: 'custbody_rm_gp_amt_sales_ord',
+                    value: parseFloat(headerGpAfterRebate.toFixed(2))
+                });
+                invoiceRec.setValue({
+                    fieldId: 'custbody_rm_gp_perc_sales_order',
+                    value: parseFloat(headerGpPctAfterRebate.toFixed(2))
+                });
+            } catch (headerGpErr) {
+                log.debug({ title: `${MODULE}.map | HEADER GP NOTE`, details: headerGpErr.message });
+            }
+
+            // Limpiar custbody_hidden_rebate_tran_fields ya que borramos los RTs viejos directamente
+            try {
+                invoiceRec.setValue({
+                    fieldId: 'custbody_hidden_rebate_tran_fields',
+                    value: ''
+                });
+            } catch (hiddenErr) {
+                log.debug({ title: `${MODULE}.map | HIDDEN TRAN FIELDS NOTE`, details: hiddenErr.message });
+            }
 
             // Actualizar multi-select custbody_rm_rebate_agg_detail_ids en la cabecera con todos los RAD IDs activos
             if (headerRadIdsSet.size > 0) {
@@ -436,7 +835,7 @@ define([
                 }
             }
 
-            // Guardar factura en modo estándar (enableSourcing: false)
+            // Guardar factura
             let savedId;
             try {
                 savedId = invoiceRec.save({
@@ -456,7 +855,7 @@ define([
 
             log.audit({
                 title: `${MODULE}.map | FACTURA ACTUALIZADA Y GUARDADA`,
-                details: `Factura: ${docNumber} (ID: ${savedId}) | Impacto Header: $${headerTotalImpact.toFixed(2)} | Líneas: ${lineCount}`
+                details: `Factura: ${docNumber} (ID: ${savedId}) | Impacto Header: $${headerTotalImpact.toFixed(2)} | GP After Rebate: $${headerGpAfterRebate.toFixed(2)} | Líneas: ${linesUpdatedCount}`
             });
 
             context.write({
@@ -464,17 +863,21 @@ define([
                 value: JSON.stringify({
                     tranId: docNumber,
                     status: 'OK',
-                    linesUpdated: lineCount
+                    linesUpdated: linesUpdatedCount
                 })
             });
 
         } catch (e) {
-            log.error({ title: `${MODULE}.map | ERROR [Factura ID: ${context.key || searchResult.id}]`, details: e.message });
+            log.error({
+                title: `${MODULE}.map | ERROR [Factura ID: ${context.key || (searchResult && searchResult.id)}]`,
+                details: e.message
+            });
         }
     };
 
     /**
-     * Resumen y reporte final: Invoca las tareas nativas del SuiteApp de Rebates (R&TP)
+     * Resumen y disparo de la tarea nativa customscript_rm_mr_rebate_transactions (customdeploy_rm_mr_rebate_transactions1)
+     * para regenerar los registros RT y RTD de las facturas actualizadas.
      */
     const summarize = (summary) => {
         let success = 0;
@@ -498,31 +901,31 @@ define([
             details: `Total: ${success} | IDs: ${invoiceIds.join(', ')} | Folios: ${invoiceList.join(', ')}`
         });
 
-        /*if (invoiceIds.length > 0) {
+        if (invoiceIds.length > 0) {
             const submittedInvIdStr = invoiceIds.join(',');
 
-            // 1. Disparar tarea nativa RM MR Rebate Transaction Deletion para eliminar los RTs viejos acumulados en custbody_hidden_rebate_tran_fields
+            // 1. Disparar tarea nativa RM MR Rebate Transactions para crear los nuevos RT y RTD y poblar custcol_rm_rebate_rcrd_link
             try {
-                const mrTaskDelete = task.create({
+                const mrCreateRtTask = task.create({
                     taskType: task.TaskType.MAP_REDUCE,
-                    scriptId: 'customscript_rm_mr_rebate_txn_deletion',
-                    deploymentId: 'customdeploy_rm_mr_rebate_txn_deletion',
+                    scriptId: 'customscript_rm_mr_rebate_transactions',
+                    deploymentId: 'customdeploy_rm_mr_rebate_transactions1',
                     params: {
                         custscript_rm_submitted_invid: submittedInvIdStr
                     }
                 });
-                const delTaskId = mrTaskDelete.submit();
+                const createRtTaskId = mrCreateRtTask.submit();
                 log.audit({
-                    title: `${MODULE}.summarize | TAREA NATIVA REBATE TXN DELETION DISPARADA`,
-                    details: `Tarea de borrado nativa enviada con éxito. Task ID: ${delTaskId} | Facturas: ${submittedInvIdStr}`
+                    title: `${MODULE}.summarize | TAREA NATIVA CREATE RT DISPARADA`,
+                    details: `Tarea customscript_rm_mr_rebate_transactions enviada con éxito. Task ID: ${createRtTaskId} | Facturas: ${submittedInvIdStr}`
                 });
-            } catch (delErr) {
-                log.error({
-                    title: `${MODULE}.summarize | ERROR ENCOLANDO REBATE TXN DELETION`,
-                    details: delErr.message
+            } catch (rtTaskErr) {
+                log.audit({
+                    title: `${MODULE}.summarize | AVISO TAREA NATIVA CREATE RT`,
+                    details: `customdeploy_rm_mr_rebate_transactions1 ya en ejecución o no disponible: ${rtTaskErr.message}`
                 });
             }
-        }*/
+        }
     };
 
     return { getInputData, map, summarize };
