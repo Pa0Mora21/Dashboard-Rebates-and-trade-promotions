@@ -283,12 +283,28 @@ define([
                     cmLines = proratedLines.map(wr => {
                         const eWr = enrichedMap[wr.workId] || wr;
                         const itemName = wr.sourceItemName || wr.sourceItemId || '';
+
+                        // El monto capturado en exceso es TOTAL (impuestos incluidos):
+                        // se separa el neto y se recalculan los impuestos sobre ese neto,
+                        // en lugar de usar los taxDetails calculados sobre la provisión original.
+                        const taxList = eWr.taxDetails || [];
+                        const totalRate = taxList.reduce((s, td) => s + (parseFloat(td.taxRate) || 0), 0) / 100;
+                        const estimatedNet = Math.round(wr.finalAmount / (1 + totalRate) * 100) / 100;
+                        const lineTaxDetails = taxList.map(td => ({
+                            ...td,
+                            taxAmount: Math.round(estimatedNet * (parseFloat(td.taxRate) || 0)) / 100
+                        }));
+                        const lineTaxTotal = lineTaxDetails.reduce((s, td) => s + td.taxAmount, 0);
+                        // El neto absorbe el residuo de redondeo para que neto + impuestos = finalAmount
+                        const netAmount = Math.round((wr.finalAmount - lineTaxTotal) * 100) / 100;
+                        lineTaxDetails.forEach(td => { td.taxBasis = netAmount; });
+
                         return {
                             itemId:      agreement.accounting_item,
-                            amount:      wr.finalAmount,
+                            amount:      netAmount,
                             taxCodeId:   wr.taxCodeId,
                             taxRate:     parseFloat(wr.taxRate || 0),
-                            taxDetails:  eWr.taxDetails || [],
+                            taxDetails:  lineTaxDetails,
                             description: itemName || `Liquidación rebate (exceso) - Acuerdo ${agreementId}`
                         };
                     });
@@ -430,7 +446,9 @@ define([
 
                     let lineGrossApply = netApply;
 
-                    if (eWr.taxDetails && Array.isArray(eWr.taxDetails) && eWr.taxDetails.length > 0) {
+                    if (scenario === 'Cobro en exceso') {
+                        // En exceso el monto capturado ya incluye impuestos: se aplica tal cual
+                    } else if (eWr.taxDetails && Array.isArray(eWr.taxDetails) && eWr.taxDetails.length > 0) {
                         // Usar taxDetails propios del WORK (fuente o destino enriquecido)
                         const baseAmount = parseFloat(eWr.amountToSettle) || netApply;
                         const lineTaxSum = eWr.taxDetails.reduce((sum, td) => sum + (parseFloat(td.taxAmount) || 0), 0);

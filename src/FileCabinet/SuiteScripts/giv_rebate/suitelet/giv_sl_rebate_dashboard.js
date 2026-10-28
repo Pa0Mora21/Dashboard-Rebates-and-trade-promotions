@@ -684,10 +684,15 @@ define([
                 // 2. Por cada factura destino, crear un WORK de destino por acuerdo
                 destLines.forEach((dst) => {
                     const dstApply = parseFloat(dst.applyAmount) || 0;
+                    let assignedApply = 0;
 
-                    agreementEntries.forEach(([agId, agAmount]) => {
+                    agreementEntries.forEach(([agId, agAmount], agIndex) => {
                         const proportion = grandTotal > 0 ? agAmount / grandTotal : 1 / agreementEntries.length;
-                        const proportionalApply = Math.round(dstApply * proportion * 100) / 100;
+                        // El último acuerdo absorbe el residuo de redondeo para que la suma cuadre con dstApply
+                        const proportionalApply = agIndex === agreementEntries.length - 1
+                            ? Math.round((dstApply - assignedApply) * 100) / 100
+                            : Math.round(dstApply * proportion * 100) / 100;
+                        assignedApply += proportionalApply;
 
                         const dstWorkData = {
                             customerId:       customerId,
