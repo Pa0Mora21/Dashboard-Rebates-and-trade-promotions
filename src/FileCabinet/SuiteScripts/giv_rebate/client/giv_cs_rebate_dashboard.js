@@ -215,9 +215,14 @@ define(['N/url', 'N/currentRecord'], (url, currentRecord) => {
                 const isSelected = rec.getSublistValue({ sublistId: SRC_SUBLIST, fieldId: 'custpage_src_select', line: i });
                 if (isSelected) {
                     const net   = parseFloat(rec.getSublistValue({ sublistId: SRC_SUBLIST, fieldId: 'custpage_src_amount',      line: i })) || 0;
-                    const gross = parseFloat(rec.getSublistValue({ sublistId: SRC_SUBLIST, fieldId: 'custpage_src_total_gross', line: i })) || net;
+
+                    const available = parseFloat(rec.getSublistValue({ sublistId: SRC_SUBLIST, fieldId: 'custpage_src_available', line: i })) || 0;
+                    const taxAmt    = parseFloat(rec.getSublistValue({ sublistId: SRC_SUBLIST, fieldId: 'custpage_src_tax_amt',   line: i })) || 0;
+                    // tax_amt viene calculado sobre el disponible; escalarlo al monto a liquidar
+                    // (en Cobro en exceso net > available y gross - net daba negativo)
+                    const taxRatio  = available > 0 ? taxAmt / available : 0;
                     totalSelectedNet  += net;
-                    totalEstimatedTax += gross - net;
+                    totalEstimatedTax += Math.round(net * taxRatio * 100) / 100;
                 }
             }
 
@@ -667,7 +672,7 @@ define(['N/url', 'N/currentRecord'], (url, currentRecord) => {
             }
 
             // Formatear CSV con UTF-8 BOM (\uFEFF) para apertura perfecta en Microsoft Excel
-            const csvContent = '\uFEFF' + rows.map(row => 
+            const csvContent = '\uFEFF' + rows.map(row =>
                 row.map(field => `"${String(field).replace(/"/g, '""')}"`).join(',')
             ).join('\r\n');
 
