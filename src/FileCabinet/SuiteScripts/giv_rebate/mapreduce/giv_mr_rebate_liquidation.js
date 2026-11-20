@@ -27,6 +27,18 @@ define([
     const MODULE = 'giv_mr_rebate_liquidation';
 
     /**
+     * Recalcula los detalles fiscales de la línea origen sobre un nuevo neto,
+     * conservando código, tipo y tasa (hereda IVA/IEPS de la línea de factura origen).
+     */
+    const rebaseTaxDetails = (taxList, netAmount) => (taxList || []).map(td => ({
+        taxCodeId: td.taxCodeId,
+        taxRate:   parseFloat(td.taxRate) || 0,
+        taxType:   td.taxType || '',
+        taxBasis:  Math.round((parseFloat(netAmount) || 0) * 100) / 100,
+        taxAmount: Math.round(((parseFloat(netAmount) || 0) * (parseFloat(td.taxRate) || 0) / 100) * 100) / 100
+    }));
+
+    /**
      * getInputData — Busca registros WORK con estado "Capturado".
      */
     const getInputData = () => {
@@ -91,6 +103,8 @@ define([
 
             const groupKey = `${agreementId}_${scenario}_${customerId}`;
 
+            const rawTaxCodeVal = values['custrecord_giv_lw_taxcode']?.value || values['custrecord_giv_lw_taxcode'] || '';
+
             const payload = {
                 workId: workId,
                 customerId: customerId,
@@ -100,20 +114,25 @@ define([
                 sourceInvoiceId: values['custrecord_giv_lw_source_invoice']?.value || values['custrecord_giv_lw_source_invoice'] || '',
                 sourceAccrualId: values['custrecord_giv_lw_source_accrual']?.value || values['custrecord_giv_lw_source_accrual'] || '',
                 sourceItemId: values['custrecord_giv_lw_source_item']?.value || values['custrecord_giv_lw_source_item'] || '',
+                sourceItemName: values['custrecord_giv_lw_source_item']?.text || '',
                 originalAmount: values['custrecord_giv_lw_original_amt'] || '0',
                 availableAmount: values['custrecord_giv_lw_available_amt'] || '0',
                 amountToSettle: values['custrecord_giv_lw_amt_to_settle'] || '0',
                 invoiceTo: values['custrecord_giv_lw_invoice_to']?.value || values['custrecord_giv_lw_invoice_to'] || '',
                 applyAmount: values['custrecord_giv_lw_apply_amount'] || '0',
-                taxCodeId: values['custrecord_giv_lw_taxcode']?.value || values['custrecord_giv_lw_taxcode'] || '',
+                taxCodeId: rawTaxCodeVal,
+                taxRate: 0,
                 taxBasis: values['custrecord_giv_lw_tax_basis'] || '0',
+                taxDetailsJson: rawTaxCodeVal,
                 excessFlag: values['custrecord_giv_lw_excess_flag'] || false,
                 csvBatchId: values['custrecord_giv_lw_csv_batch_id'] || ''
             };
 
-            // Para escenarios que se procesan individualmente (Estándar)
+            // Para Escenario Estándar: agrupar por factura origen para permitir múltiples
+            // líneas de provisión de la misma factura en un solo Credit Memo/transacción.
             if (scenario === 'Estándar') {
-                context.write({ key: `${groupKey}_${workId}`, value: JSON.stringify(payload) });
+                const invKey = payload.sourceInvoiceId || workId;
+                context.write({ key: `${groupKey}_${invKey}`, value: JSON.stringify(payload) });
             } else {
                 context.write({ key: groupKey, value: JSON.stringify(payload) });
             }
@@ -228,7 +247,18 @@ define([
                 let cmLines = [];
                 let invoiceApplications = [];
                 let accountingItemId = '';
-                let taxDetailsLines = [];
+                let taxDetails = [];
+
+                // Enriquecer workRecords con TODOS los detalles fiscales (IEPS, IVA 0%, IVA 16%, etc.)
+                // desde la factura origen usando getAllTaxDetailsFromInvoiceLine para TODOS los escenarios.
+                const sourceWRs = workRecords.filter(wr => parseFloat(wr.amountToSettle) > 0);
+                const enrichedWRs = taxUtils.enrichWithTaxInfo(sourceWRs);
+                log.audit({title: 'enrichedWRs pao',
+                    details: enrichedWRs})
+                const enrichedMap = {};
+                enrichedWRs.forEach(wr => { enrichedMap[wr.workId] = wr; });
+                log.audit({title: 'enrichedMap',
+                    details: enrichedMap})
 
                 if (scenario === 'Agrupación') {
                     // Escenario 9 — Agrupación
@@ -237,11 +267,7 @@ define([
                     }
 
                     accountingItemId = agreement.accounting_item;
-
-                    // Solo registros de fuente (amountToSettle > 0) participan en el Tax Override
-                    const sourceWRs = workRecords.filter(wr => parseFloat(wr.amountToSettle) > 0);
-                    const enriched = taxUtils.enrichWithTaxInfo(sourceWRs);
-                    taxDetailsLines = taxUtils.buildTaxDetailsOverride(enriched);
+                    taxDetails = taxUtils.buildTaxDetailsOverride(enrichedWRs);
 
                     // Solo registros de fuente contribuyen al CM
                     cmLines = sourceWRs.map(wr => ({
@@ -250,47 +276,79 @@ define([
                     }));
 
                 } else if (scenario === 'Cobro en exceso') {
-                    // Escenario 4 — Prorrateo del excedente entre líneas de fuente
-                    // DRD: Monto Final Línea = Provisión Línea + ((Provisión Línea / Total Provisión) × Excedente)
-                    // totalRequested = suma de amountToSettle del usuario (puede ser > totalAvailable)
-                    // provisionAmount = availableAmount por línea (base del prorrateo)
-                    const sourceWorkRecords = workRecords.filter(wr => parseFloat(wr.amountToSettle) > 0);
+                    // Escenario 4 — Cobro en exceso (minuta GV 29-oct-2026):
+                    //  · 1 línea por provisión con el artículo del acuerdo por min(liquidar, disponible).
+                    //  · Excedente por línea = liquidar − disponible, acumulado por combinación de impuestos
+                    //    de la línea de factura origen → 1 línea con el artículo de excedente por cada combinación.
+                    //  · Montos netos: IVA/IEPS se calculan encima, heredados de la línea origen.
+                    //  · El excedente solo se captura en origen (validado en validator/cliente/CSV).
+                    if (!agreement || !agreement.accounting_item) {
+                        throw new Error('El acuerdo de reembolso no tiene configurado el artículo contable (custrecord_rm_accounting_item).');
+                    }
 
-                    // El total solicitado proviene de los WORK records (lo que el usuario capturó)
-                    const totalRequested = sourceWorkRecords.reduce((sum, wr) => sum + (parseFloat(wr.amountToSettle) || 0), 0);
+                    const excessGroups = {};   // taxKey → { amount, taxList }
+                    const agreementLabel = agreement.name || `Acuerdo ${agreementId}`;
 
-                    const linesForProration = sourceWorkRecords.map(wr => ({
-                        ...wr,
-                        provisionAmount: parseFloat(wr.availableAmount) || 0  // peso = saldo disponible
-                    }));
+                    enrichedWRs.forEach(wr => {
+                        const requested    = Math.round((parseFloat(wr.amountToSettle) || 0) * 100) / 100;
+                        const available    = Math.round((parseFloat(wr.availableAmount) || 0) * 100) / 100;
+                        const provisionNet = Math.round(Math.min(requested, available) * 100) / 100;
+                        const excessNet    = Math.round((requested - available) * 100) / 100;
+                        const taxList      = wr.taxDetails || [];
+                        const itemName     = wr.sourceItemName || wr.sourceItemId || '';
 
-                    const proratedLines = validator.calculateExcessProration(linesForProration, totalRequested);
+                        if (provisionNet > 0) {
+                            cmLines.push({
+                                itemId:      agreement.accounting_item,
+                                amount:      provisionNet,
+                                taxCodeId:   wr.taxCodeId,
+                                taxRate:     parseFloat(wr.taxRate || 0),
+                                taxDetails:  rebaseTaxDetails(taxList, provisionNet),
+                                description: itemName || `Liquidación rebate - ${agreementLabel}`
+                            });
+                        }
 
-                    cmLines = proratedLines.map(wr => ({
-                        itemId:      agreement.accounting_item,
-                        amount:      wr.finalAmount,
-                        taxCodeId:   wr.taxCodeId,
-                        description: `Liquidación rebate (exceso) - Acuerdo ${agreementId}`
-                    }));
+                        if (excessNet > 0) {
+                            const taxKey = taxList
+                                .map(td => `${td.taxCodeId || ''}@${parseFloat(td.taxRate) || 0}`)
+                                .sort()
+                                .join('|') || `tc:${wr.taxCodeId || ''}`;
+                            if (!excessGroups[taxKey]) {
+                                excessGroups[taxKey] = { amount: 0, taxList: taxList, taxCodeId: wr.taxCodeId };
+                            }
+                            excessGroups[taxKey].amount = Math.round((excessGroups[taxKey].amount + excessNet) * 100) / 100;
+                        }
+                    });
 
-                    // [FIX 1] Actualizar cada WORK con el monto prorrateado real del CM
-                    // Antes este updateWorkRecord era un no-op (proratedAmount no estaba mapeado)
-                    proratedLines.forEach(wr => {
-                        txnBuilder.updateWorkRecord(wr.workId, {
-                            proratedAmount: wr.finalAmount   // → custrecord_giv_lw_amt_to_settle
+                    const excessGroupList = Object.values(excessGroups);
+                    // Artículo de excedente configurado en el acuerdo (custrecord_giv_excess_item).
+                    const excessItemId = agreement.excessItem;
+                    if (excessGroupList.length && !excessItemId) {
+                        throw new Error(`El acuerdo "${agreementLabel}" no tiene configurado el artículo de Cobro en exceso (custrecord_giv_excess_item).`);
+                    }
+
+                    excessGroupList.forEach(grp => {
+                        cmLines.push({
+                            itemId:      excessItemId,
+                            amount:      grp.amount,
+                            taxCodeId:   grp.taxCodeId,
+                            taxDetails:  rebaseTaxDetails(grp.taxList, grp.amount),
+                            description: `Cobro en exceso - ${agreementLabel}`
                         });
+                    });
+
+                    log.audit({
+                        title:   `${MODULE}.reduce.excess`,
+                        details: `Cobro en exceso | Acuerdo ${agreementId} | ${enrichedWRs.length} provisiones → ${cmLines.length} líneas CM (${Object.keys(excessGroups).length} línea(s) de excedente)`
                     });
 
                 } else {
                     // Escenarios 1, 2, 3 — solo registros de fuente (amountToSettle > 0) al CM
-
-                    // Consolidada: descripción enriquecida con nombre de acuerdo + tranid de factura origen.
-                    // Se hace un lookup por lote de las facturas únicas para no multiplicar llamadas a la API.
                     let invoiceTranIdMap = {};
                     if (scenario === 'Consolidada') {
                         const uniqueInvoiceIds = [...new Set(
-                            workRecords
-                                .filter(wr => parseFloat(wr.amountToSettle) > 0 && wr.sourceInvoiceId)
+                            sourceWRs
+                                .filter(wr => wr.sourceInvoiceId)
                                 .map(wr => wr.sourceInvoiceId)
                         )];
 
@@ -307,59 +365,68 @@ define([
                                     title:   `${MODULE}.reduce.invoiceLookup`,
                                     details: `No se pudo obtener tranid de factura ${invId}: ${le.message || le}`
                                 });
-                                invoiceTranIdMap[invId] = invId; // fallback: usar el ID interno
+                                invoiceTranIdMap[invId] = invId;
                             }
                         });
                     }
 
-                    const agreementName = agreement.name || `Acuerdo ${agreementId}`;
+                    //const agreementName = agreement.name || `Acuerdo ${agreementId}`;
 
                     if (scenario === 'Específica (por SKU)') {
                         // Agrupar por sourceItemId: 1 línea en el CM por SKU único.
-                        // Si varias provisiones comparten el mismo artículo, sus montos se suman.
                         const skuMap = {};
-                        workRecords
-                            .filter(wr => parseFloat(wr.amountToSettle) > 0)
-                            .forEach(wr => {
-                                const skuKey = wr.sourceItemId || '__sin_sku__';
-                                if (!skuMap[skuKey]) {
-                                    skuMap[skuKey] = {
-                                        sourceItemId: wr.sourceItemId,           // para lookup de nombre y descripción
-                                        itemId:       agreement.accounting_item,  // ítem contable del acuerdo (OthCharge)
-                                        amount:       0,
-                                        taxCodeId:    wr.taxCodeId               // taxCode del primer WORK del SKU
-                                    };
-                                }
-                                skuMap[skuKey].amount += parseFloat(wr.amountToSettle) || 0;
-                            });
-
-                        // Lookup por lote de los nombres de artículo (campo 'itemid' = código/nombre en NS)
-                        // Patrón idéntico al lookup de tranid en Consolidada — una llamada por SKU único.
-                        const skuNameMap = {};
-                        Object.values(skuMap).forEach(sku => {
-                            if (!sku.sourceItemId) return;
-                            try {
-                                const itemFields = search.lookupFields({
-                                    type:    search.Type.ITEM,
-                                    id:      sku.sourceItemId,
-                                    columns: ['itemid', 'displayname']
+                        enrichedWRs.forEach(wr => {
+                            const skuKey = wr.sourceItemId || '__sin_sku__';
+                            if (!skuMap[skuKey]) {
+                                skuMap[skuKey] = {
+                                    sourceItemId:   wr.sourceItemId,           // para lookup de nombre y descripción
+                                    itemId:         agreement.accounting_item,  // ítem contable del acuerdo (OthCharge)
+                                    amount:         0,
+                                    taxCodeId:      wr.taxCodeId,
+                                    taxRate:        parseFloat(wr.taxRate || 0),
+                                    taxDetailsMap:  {},
+                                    sourceItemName: wr.sourceItemName,
+                                };
+                            }
+                            skuMap[skuKey].amount += parseFloat(wr.amountToSettle) || 0;
+                            if (wr.taxDetails && wr.taxDetails.length > 0) {
+                                wr.taxDetails.forEach(td => {
+                                    const tcKey = String(td.taxCodeId || '');
+                                    if (!tcKey) return;
+                                    if (!skuMap[skuKey].taxDetailsMap[tcKey]) {
+                                        skuMap[skuKey].taxDetailsMap[tcKey] = {
+                                            taxCodeId: td.taxCodeId,
+                                            taxRate:   td.taxRate || 0,
+                                            taxType:   td.taxType || '',
+                                            taxBasis:  0,
+                                            taxAmount: 0
+                                        };
+                                    }
+                                    skuMap[skuKey].taxDetailsMap[tcKey].taxBasis  += parseFloat(td.taxBasis  || 0);
+                                    skuMap[skuKey].taxDetailsMap[tcKey].taxAmount += parseFloat(td.taxAmount || 0);
                                 });
-                                skuNameMap[sku.sourceItemId] = itemFields.displayname || itemFields.itemid || String(sku.sourceItemId);
-                            } catch (ile) {
-                                log.error({
-                                    title:   `${MODULE}.reduce.itemLookup`,
-                                    details: `No se pudo obtener nombre del artículo ${sku.sourceItemId}: ${ile.message || ile}`
-                                });
-                                skuNameMap[sku.sourceItemId] = String(sku.sourceItemId); // fallback: usar el ID
                             }
                         });
 
-                        cmLines = Object.values(skuMap).map(sku => ({
-                            itemId:      sku.itemId,                                                  // accounting_item del acuerdo
-                            amount:      Math.round(sku.amount * 100) / 100,
-                            taxCodeId:   sku.taxCodeId,
-                            description: `Liquidación rebate por SKU ${skuNameMap[sku.sourceItemId] || sku.sourceItemId || ''} - Acuerdo ${agreementId}`
-                        }));
+                        cmLines = Object.values(skuMap).map(sku => {
+                            const itemName = sku.sourceItemName || sku.sourceItemId || '';
+                            const consolidatedTaxDetails = Object.values(sku.taxDetailsMap).map(td => ({
+                                taxCodeId: td.taxCodeId,
+                                taxRate:   td.taxRate,
+                                taxType:   td.taxType,
+                                taxBasis:  Math.round(td.taxBasis  * 100) / 100,
+                                taxAmount: Math.round(td.taxAmount * 100) / 100
+                            }));
+
+                            return {
+                                itemId:      sku.itemId,
+                                amount:      Math.round(sku.amount * 100) / 100,
+                                taxCodeId:   sku.taxCodeId,
+                                taxRate:     sku.taxRate,
+                                taxDetails:  consolidatedTaxDetails,
+                                description: itemName || `Liquidación rebate por SKU - Acuerdo ${agreementId}`
+                            };
+                        });
 
                         log.debug({
                             title:   `${MODULE}.reduce.skuGrouping`,
@@ -367,35 +434,70 @@ define([
                         });
 
                     } else {
-                        cmLines = workRecords
-                            .filter(wr => parseFloat(wr.amountToSettle) > 0)
-                            .map(wr => {
-                                let description;
-                                if (scenario === 'Consolidada') {
-                                    const invoiceName = invoiceTranIdMap[wr.sourceInvoiceId] || wr.sourceInvoiceId;
-                                    description = `${agreementName} - ${invoiceName}`;
-                                } else {
-                                    description = `Liquidación rebate - Acuerdo ${agreementId}`;
-                                }
-                                return {
-                                    itemId:      agreement.accounting_item,
-                                    amount:      parseFloat(wr.amountToSettle) || 0,
-                                    taxCodeId:   wr.taxCodeId,
-                                    description: description
-                                };
-                            });
+                        cmLines = enrichedWRs.map(wr => {
+                            const itemName = wr.sourceItemName || wr.sourceItemId || '';
+                            log.audit({ title: 'Consolidada/Estándar escenario', details: wr });
+                            return {
+                                itemId:      agreement.accounting_item,
+                                amount:      parseFloat(wr.amountToSettle) || 0,
+                                taxCodeId:   wr.taxCodeId,
+                                taxRate:     parseFloat(wr.taxRate || 0),
+                                taxDetails:  wr.taxDetails || [],
+                                description: itemName || `Liquidación rebate - Acuerdo ${agreementId}`
+                            };
+                        });
                     }
                 }
 
-                // Preparar aplicación de facturas destino
+                // Preparar aplicación de facturas destino:
+                // El monto a aplicar en la factura debe ser el TOTAL BRUTO (neto + impuestos)
+                // para que el CM quede completamente aplicado sin saldo pendiente.
+                // Se calcula el taxRatio del grupo desde los sourceWRs enriquecidos.
+                const groupNetTotal = enrichedWRs.reduce((s, wr) => s + (parseFloat(wr.amountToSettle) || 0), 0);
+                const groupTaxTotal = enrichedWRs.reduce((s, wr) => {
+                    const taxDetails = wr.taxDetails || [];
+                    return s + taxDetails.reduce((ts, td) => ts + (parseFloat(td.taxAmount) || 0), 0);
+                }, 0);
+                const groupTaxRatio = groupNetTotal > 0 ? groupTaxTotal / groupNetTotal : 0;
+
+                // Cobro en exceso: proporción impuesto/neto de las líneas reales del CM
+                // (provisión + excedente), para aplicar el bruto a la factura destino.
+                const cmNetTotal = cmLines.reduce((s, l) => s + (parseFloat(l.amount) || 0), 0);
+                const cmTaxTotal = cmLines.reduce((s, l) => s + (l.taxDetails || []).reduce((ts, td) => ts + (parseFloat(td.taxAmount) || 0), 0), 0);
+                const cmTaxRatio = cmNetTotal > 0 ? cmTaxTotal / cmNetTotal : 0;
+
                 const invoiceMap = {};
                 workRecords.forEach(wr => {
-                    if (wr.invoiceTo) {
-                        if (!invoiceMap[wr.invoiceTo]) {
-                            invoiceMap[wr.invoiceTo] = 0;
+                    if (!wr.invoiceTo) return;
+                    if (!invoiceMap[wr.invoiceTo]) invoiceMap[wr.invoiceTo] = 0;
+
+                    const eWr = enrichedMap[wr.workId] || wr;
+                    // Base neta: applyAmount si está seteado, sino amountToSettle (fuente) o 0 (destino puro)
+                    const netApply = parseFloat(wr.applyAmount) > 0
+                        ? parseFloat(wr.applyAmount)
+                        : parseFloat(wr.amountToSettle) || 0;
+
+                    let lineGrossApply = netApply;
+
+                    if (scenario === 'Cobro en exceso') {
+                        // Montos netos: se agregan los impuestos con la proporción real del CM
+                        lineGrossApply = netApply * (1 + cmTaxRatio);
+                    } else if (eWr.taxDetails && Array.isArray(eWr.taxDetails) && eWr.taxDetails.length > 0) {
+                        // Usar taxDetails propios del WORK (fuente o destino enriquecido)
+                        const baseAmount = parseFloat(eWr.amountToSettle) || netApply;
+                        const lineTaxSum = eWr.taxDetails.reduce((sum, td) => sum + (parseFloat(td.taxAmount) || 0), 0);
+                        if (baseAmount > 0) {
+                            lineGrossApply = netApply * (1 + lineTaxSum / baseAmount);
                         }
-                        invoiceMap[wr.invoiceTo] += parseFloat(wr.applyAmount) || 0;
+                    } else if (groupTaxRatio > 0) {
+                        // Fallback: usar el taxRatio del grupo
+                        lineGrossApply = netApply * (1 + groupTaxRatio);
+                    } else if (parseFloat(eWr.taxRate) > 0) {
+                        const ratePct = parseFloat(eWr.taxRate);
+                        lineGrossApply = netApply * (1 + (ratePct > 1 ? ratePct : ratePct * 100) / 100);
                     }
+
+                    invoiceMap[wr.invoiceTo] += lineGrossApply;
                 });
 
                 invoiceApplications = Object.entries(invoiceMap).map(([invoiceId, amount]) => ({
@@ -409,7 +511,7 @@ define([
                     invoiceApplications: invoiceApplications,
                     scenario:            scenario,
                     accountingItemId:    accountingItemId,
-                    taxDetailsLines:     taxDetailsLines,
+                    taxDetails:          taxDetails,
                     location:            locationId,
                     formId:              589  // RM Credit Memo Disbursement (confirmado vía CM80 en Sandbox)
                     // settlementHistoryId se añade en Fase posterior (post-Claim)
@@ -445,13 +547,7 @@ define([
             }
 
             // ── Actualizar WORK a Completado y crear History ──
-            // [FIX 2] Calcular la diferencia GLOBAL antes del loop para Cobro en exceso.
-            // DRD: la diferencia es el excedente total del lote, no una diferencia por línea individual.
-            const totalAvailableInGroup = workRecords.reduce((s, wr) => s + (parseFloat(wr.availableAmount) || 0), 0);
             const totalSettledInGroup   = workRecords.reduce((s, wr) => s + (parseFloat(wr.amountToSettle)  || 0), 0);
-            const globalDiff = scenario === 'Cobro en exceso'
-                ? Math.round((totalSettledInGroup - totalAvailableInGroup) * 100) / 100
-                : 0;
 
             workRecords.forEach(wr => {
                 txnBuilder.updateWorkRecord(wr.workId, {
@@ -479,9 +575,11 @@ define([
                     accrualAmount:          parseFloat(wr.originalAmount) || 0,
                     settledAmount:          parseFloat(wr.amountToSettle) || 0,
                     appliedAmount:          parseFloat(wr.applyAmount) || 0,
-                    // [FIX 2] globalDiff = excedente total del lote, no diferencia por línea
-                    difference:             globalDiff,
-                    taxCodeId:              wr.taxCodeId,
+                    // Cobro en exceso: excedente de esta línea (liquidar − disponible); resto: 0
+                    difference:             scenario === 'Cobro en exceso'
+                        ? Math.max(0, Math.round(((parseFloat(wr.amountToSettle) || 0) - (parseFloat(wr.availableAmount) || 0)) * 100) / 100)
+                        : 0,
+                    taxDetailsJson:         wr.taxDetailsJson || (wr.taxDetails ? JSON.stringify(wr.taxDetails) : ''),
                     taxBasis:               parseFloat(wr.taxBasis) || 0,
                     csvBatchId:             wr.csvBatchId
                 });

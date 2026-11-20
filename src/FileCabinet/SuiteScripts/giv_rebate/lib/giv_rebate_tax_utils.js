@@ -13,21 +13,7 @@ define(['N/log', './giv_rebate_dao'], (log, dao) => {
 
     const MODULE = 'giv_rebate_tax_utils';
 
-    /**
-     * Obtiene el Tax Schedule/Code de un artículo en la factura origen (UN solo impuesto).
-     * Usado por escenarios 1-4 donde cada línea del CM lleva su propio taxcode.
-     */
-    const getTaxScheduleFromSourceInvoice = (invoiceId, itemId) => {
-        try {
-            return dao.getTaxInfoFromInvoiceLine(invoiceId, itemId);
-        } catch (e) {
-            log.error({
-                title: `${MODULE}.getTaxScheduleFromSourceInvoice`,
-                details: `[InvoiceId=${invoiceId}, ItemId=${itemId}] ${e.message || e}`
-            });
-            return { taxScheduleId: '', taxScheduleText: '', taxRate: 0, lineAmount: 0 };
-        }
-    };
+
 
     /**
      * Enriquece registros WORK con TODOS los detalles fiscales de la factura origen.
@@ -45,14 +31,26 @@ define(['N/log', './giv_rebate_dao'], (log, dao) => {
                 const itemId    = wr.sourceItemId || '';
                 const amount    = parseFloat(wr.amountToSettle || 0);
 
+                // 1. Si el registro WORK ya trae 'taxDetailsJson', parsearlo directamente
+                if (wr.taxDetailsJson) {
+                    try {
+                        const parsed = typeof wr.taxDetailsJson === 'string' ? JSON.parse(wr.taxDetailsJson) : wr.taxDetailsJson;
+                        if (Array.isArray(parsed) && parsed.length > 0) {
+                            return { ...wr, taxDetails: parsed };
+                        }
+                    } catch (eParse) {
+                        log.debug({ title: `${MODULE}.enrichWithTaxInfo.parseJson`, details: `Error parseando taxDetailsJson: ${eParse.message || eParse}` });
+                    }
+                }
+
                 if (!invoiceId || !itemId) return { ...wr, taxDetails: [] };
 
                 // Leer TODOS los impuestos de esa línea (IEPS + IVA, etc.)
                 const taxDetails = dao.getAllTaxDetailsFromInvoiceLine(invoiceId, itemId, amount);
 
                 log.debug({
-                    title: `${MODULE}.enrichWithTaxInfo`,
-                    details: `WORK inv=${invoiceId}, item=${itemId}, amt=${amount} → ${taxDetails.length} tax lines`
+                    title: 'enrichWithTaxInfo',
+                    details: taxDetails
                 });
 
                 return { ...wr, taxDetails };
@@ -159,7 +157,7 @@ define(['N/log', './giv_rebate_dao'], (log, dao) => {
     };
 
     return {
-        getTaxScheduleFromSourceInvoice,
+       // getTaxScheduleFromSourceInvoice,
         buildTaxDetailsOverride,
         calculateTaxBasis,
         enrichWithTaxInfo

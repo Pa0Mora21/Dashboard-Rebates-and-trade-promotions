@@ -146,13 +146,17 @@ define([
             sourceSublist.addField({ id: 'custpage_src_settled', type: serverWidget.FieldType.CURRENCY, label: LBL.SRC_SETTLED });
             sourceSublist.addField({ id: 'custpage_src_returns', type: serverWidget.FieldType.CURRENCY, label: LBL.SRC_RETURNS });
             sourceSublist.addField({ id: 'custpage_src_available', type: serverWidget.FieldType.CURRENCY, label: LBL.SRC_AVAILABLE });
-            sourceSublist.addField({ id: 'custpage_src_amount', type: serverWidget.FieldType.CURRENCY, label: LBL.SRC_AMOUNT })
+           sourceSublist.addField({ id: 'custpage_src_amount', type: serverWidget.FieldType.CURRENCY, label: LBL.SRC_AMOUNT })
                 .updateDisplayType({ displayType: serverWidget.FieldDisplayType.ENTRY });
+            sourceSublist.addField({ id: 'custpage_src_tax_rate',    type: serverWidget.FieldType.PERCENT,   label: LBL.SRC_TAX_RATE });
+            sourceSublist.addField({ id: 'custpage_src_tax_amt',     type: serverWidget.FieldType.CURRENCY,  label: LBL.SRC_TAX_AMT });
+            sourceSublist.addField({ id: 'custpage_src_total_gross', type: serverWidget.FieldType.CURRENCY,  label: LBL.SRC_TOTAL_GROSS });
             sourceSublist.addField({ id: 'custpage_src_currency', type: serverWidget.FieldType.TEXT, label: LBL.CURRENCY });
 
             // ── Botones de selección masiva (dentro del toolbar de la sublista) ──
             sourceSublist.addButton({ id: 'custpage_select_all',   label: LBL.BTN_SELECT_ALL   || 'Seleccionar Todas', functionName: 'selectAllProvisions'   });
             sourceSublist.addButton({ id: 'custpage_deselect_all', label: LBL.BTN_DESELECT_ALL || 'Desmarcar Todas',   functionName: 'deselectAllProvisions' });
+            sourceSublist.addButton({ id: 'custpage_export_excel_sublist', label: 'Exportar a Excel', functionName: 'exportToExcel' });
 
             // Campos ocultos
             sourceSublist.addField({ id: 'custpage_src_accrual_id', type: serverWidget.FieldType.TEXT, label: 'Accrual ID' }).updateDisplayType({ displayType: serverWidget.FieldDisplayType.HIDDEN });
@@ -230,6 +234,27 @@ define([
                 log.debug({ title: `${MODULE}.renderDashboard - Settlement Method`, details: `Agreement ${firstAgreementId} → method=${settlementMethod}` });
             }
 
+            let accruals = [];
+            if (hasFilters) {
+                const defaults = {};
+                if (params.custpage_agreement)      defaults.custpage_agreement      = params.custpage_agreement;
+                if (params.custpage_customer)        defaults.custpage_customer        = params.custpage_customer;
+                if (params.custpage_source_invoice)  defaults.custpage_source_invoice  = params.custpage_source_invoice;
+                if (params.custpage_scenario)        defaults.custpage_scenario        = params.custpage_scenario;
+                if (params.custpage_date_from)       defaults.custpage_date_from       = params.custpage_date_from;
+                if (params.custpage_date_to)         defaults.custpage_date_to         = params.custpage_date_to;
+                if (params.custpage_item)            defaults.custpage_item            = params.custpage_item;
+                form.updateDefaultValues(defaults);
+
+                accruals = populateSourceSublist(sourceSublist, params, LBL);
+
+                // Si no se filtró por acuerdo explícitamente, inferir el método desde las provisiones encontradas
+                if (!settlementMethod && accruals.length > 0) {
+                    settlementMethod = parseInt(accruals[0].settlementMethod) || null;
+                    log.debug({ title: `${MODULE}.renderDashboard - Inferred Settlement Method`, details: `From accruals → method=${settlementMethod}` });
+                }
+            }
+
             // Campo hidden para que el client script conozca el método
             const settlementMethodField = form.addField({
                 id: 'custpage_settlement_method',
@@ -256,21 +281,12 @@ define([
                 destSublist.addField({ id: 'custpage_dst_amount', type: serverWidget.FieldType.CURRENCY, label: LBL.DST_AMOUNT })
                     .updateDisplayType({ displayType: serverWidget.FieldDisplayType.ENTRY });
                 destSublist.addField({ id: 'custpage_dst_currency', type: serverWidget.FieldType.TEXT, label: LBL.CURRENCY });
+                // Campo oculto para transportar el subtotal neto al M/R
+                destSublist.addField({ id: 'custpage_dst_subtotal', type: serverWidget.FieldType.CURRENCY, label: 'Subtotal' }).updateDisplayType({ displayType: serverWidget.FieldDisplayType.HIDDEN });
             }
 
-            if (hasFilters) {
-                const defaults = {};
-                if (params.custpage_agreement)      defaults.custpage_agreement      = params.custpage_agreement;
-                if (params.custpage_customer)        defaults.custpage_customer        = params.custpage_customer;
-                if (params.custpage_source_invoice)  defaults.custpage_source_invoice  = params.custpage_source_invoice;
-                if (params.custpage_scenario)        defaults.custpage_scenario        = params.custpage_scenario;
-                if (params.custpage_date_from)       defaults.custpage_date_from       = params.custpage_date_from;
-                if (params.custpage_date_to)         defaults.custpage_date_to         = params.custpage_date_to;
-                if (params.custpage_item)            defaults.custpage_item            = params.custpage_item;
-                form.updateDefaultValues(defaults);
-
-                populateSourceSublist(sourceSublist, params);
-                populateDestSublist(destSublist, params, settlementMethod);
+            if (hasFilters && destSublist) {
+                populateDestSublist(destSublist, params, settlementMethod, accruals);
             }
 
             // Campo hidden para acción POST
@@ -291,8 +307,13 @@ define([
 
     /**
      * Puebla la sublista de provisiones disponibles.
+     *
+     * @param {Object} sublist
+     * @param {Object} params
+     * @param {Object} LBL
+     * @returns {Object[]} accruals encontrados
      */
-    const populateSourceSublist = (sublist, params) => {
+    const populateSourceSublist = (sublist, params, LBL) => {
         try {
             log.debug('Dashboard Params', params);
             const filters = {};
@@ -310,9 +331,9 @@ define([
             if (params.custpage_item) {
                 const itemParts = params.custpage_item.split('\u0005').filter(Boolean);
                 if (itemParts.length > 1) {
-                    filters.itemIds = itemParts;       // MULTISELECT: múltiples artículos
+                    filters.itemIds = itemParts;
                 } else if (itemParts.length === 1) {
-                    filters.itemId = itemParts[0];     // un solo artículo
+                    filters.itemId = itemParts[0];
                 }
             }
             if (params.custpage_date_from) filters.dateFrom = params.custpage_date_from;
@@ -321,7 +342,13 @@ define([
             const accruals = dao.getAvailableAccruals(filters);
             log.debug('Accruals Found', accruals.length);
 
-            sublist.label = 'Provisiones Disponibles (' + accruals.length + ')';
+            sublist.label = `${LBL.SRC_TITLE} (${accruals.length})`;
+
+            // Pre-calcular impuestos de todos los accruals en UNA sola query batch
+            const taxPairs = accruals
+                .filter(a => a.invoiceId && a.itemId)
+                .map(a => ({ invoiceId: a.invoiceId, itemId: a.itemId, amount: parseFloat(a.availableAmount) || 0 }));
+            const taxBatchMap = dao.getAllTaxDetailsBatch(taxPairs);
 
             accruals.forEach((accrual, index) => {
                 // Función helper para valores seguros
@@ -350,6 +377,24 @@ define([
                     sublist.setSublistValue({ id: 'custpage_src_available',  line: index, value: safeNumber(accrual.availableAmount) });
                     // Pre-poblar "Monto a Liquidar" con el saldo disponible (editable por el usuario)
                     sublist.setSublistValue({ id: 'custpage_src_amount',     line: index, value: safeNumber(accrual.availableAmount) });
+
+                    // Pre-cálculo de impuestos desde el mapa batch
+                    const taxKey     = `${accrual.invoiceId}_${accrual.itemId}`;
+                    const taxDetails = taxBatchMap[taxKey] || [];
+                    const available  = parseFloat(accrual.availableAmount) || 0;
+                    // taxAmount se recalcula con el availableAmount real del accrual
+                    // porque el batch map usa lineNetAmount (total de la línea en la factura)
+                    const totalTaxAmt = taxDetails.reduce((sum, td) => {
+                        const rate = (parseFloat(td.taxRate) || 0) / 100;  // taxRate ya viene como 8.00
+                        return sum + Math.round(available * rate * 100) / 100;
+                    }, 0);
+                    const primaryRate = taxDetails.length > 0 ? (parseFloat(taxDetails[0].taxRate) || 0) : 0;
+                    const grossTotal  = available + totalTaxAmt;
+
+                    sublist.setSublistValue({ id: 'custpage_src_tax_rate',    line: index, value: primaryRate.toFixed(2) });
+                    sublist.setSublistValue({ id: 'custpage_src_tax_amt',     line: index, value: totalTaxAmt.toFixed(2) });
+                    sublist.setSublistValue({ id: 'custpage_src_total_gross', line: index, value: grossTotal.toFixed(2) });
+
                     sublist.setSublistValue({ id: 'custpage_src_currency',   line: index, value: safeValue(accrual.currencyText, 'MXN') });
 
                     // Campos ocultos - SIEMPRE deben tener valor
@@ -371,9 +416,11 @@ define([
             });
 
             log.debug({ title: `${MODULE}.populateSourceSublist`, details: `Populated ${accruals.length} source lines` });
+            return accruals;
 
         } catch (e) {
             log.error({ title: `${MODULE}.populateSourceSublist`, details: e.message || e });
+            return [];
         }
     };
 
@@ -384,10 +431,11 @@ define([
      * @param {Object} sublist
      * @param {Object} params
      * @param {number|null} settlementMethod  - Valor numérico de custrecord_rm_settlement_method
+     * @param {Object[]} [accruals]           - Provisiones encontradas en la búsqueda origen
      */
-    const populateDestSublist = (sublist, params, settlementMethod) => {
+    const populateDestSublist = (sublist, params, settlementMethod, accruals = []) => {
         try {
-            if (!params.custpage_agreement) return;
+            if (!sublist) return;
 
             // DRD Punto 4: Solo mostrar facturas destino cuando el método sea Credit Memo
             if (settlementMethod !== null && settlementMethod !== CONST.SETTLEMENT_METHOD.CREDIT_MEMO) {
@@ -398,16 +446,31 @@ define([
                 return;
             }
 
-            // Parsear multiselect de acuerdos (\u0005 es el delimitador de NetSuite multiselect)
-            const agreementIds = (params.custpage_agreement || '').split('\u0005').map(s => s.trim()).filter(Boolean);
-            if (agreementIds.length === 0) return;
+            // 1. Clientes seleccionados explícitamente en el filtro Customer
+            const filterCustomerIds = (params.custpage_customer || '').split('\u0005').map(s => s.trim()).filter(Boolean);
 
-            const customerIds = dao.getCustomersByAgreement(agreementIds);
-            if (customerIds.length === 0) {
-                log.debug({ title: `${MODULE}.populateDestSublist`, details: `No customers found for agreements: [${agreementIds.join(',')}]` });
-                return;
+            let customerIds = [];
+            if (filterCustomerIds.length > 0) {
+                // Si el usuario seleccionó cliente(s) y/o subcliente(s), traer facturas destino de esos clientes
+                customerIds = [...new Set(filterCustomerIds)];
+            } else {
+                // Si no seleccionó filtro de cliente (ej. filtró por Item, Source Invoice o Agreement),
+                // derivar los clientes a partir de los acuerdos y de las provisiones encontradas
+                const filterAgreementIds  = (params.custpage_agreement || '').split('\u0005').map(s => s.trim()).filter(Boolean);
+                const accrualAgreementIds = accruals.map(a => a.agreementId).filter(Boolean);
+                const agreementIds        = [...new Set([...filterAgreementIds, ...accrualAgreementIds])];
+
+                const agreementCustomerIds = agreementIds.length > 0 ? dao.getCustomersByAgreement(agreementIds) : [];
+                const accrualCustomerIds   = accruals.map(a => a.customerId).filter(Boolean);
+                const accrualPayerIds      = accruals.map(a => a.payerId).filter(Boolean);
+
+                customerIds = [...new Set([...agreementCustomerIds, ...accrualCustomerIds, ...accrualPayerIds])];
             }
 
+            if (customerIds.length === 0) {
+                log.debug({ title: `${MODULE}.populateDestSublist`, details: 'No customers found to query open destination invoices.' });
+                return;
+            }
 
             const invoices = dao.getOpenInvoices(customerIds);
 
@@ -418,11 +481,11 @@ define([
                 sublist.setSublistValue({ id: 'custpage_dst_date', line: index, value: inv.date || '' });
                 sublist.setSublistValue({ id: 'custpage_dst_total', line: index, value: inv.total.toFixed(2) });
                 sublist.setSublistValue({ id: 'custpage_dst_open', line: index, value: inv.amountRemaining.toFixed(2) });
-                sublist.setSublistValue({ id: 'custpage_dst_amount', line: index, value: inv.amountRemaining.toFixed(2) }); // pre-populated, editable
+                sublist.setSublistValue({ id: 'custpage_dst_amount', line: index, value: inv.amountRemaining.toFixed(2) });
                 sublist.setSublistValue({ id: 'custpage_dst_currency', line: index, value: inv.currencyText || '' });
             });
 
-            log.debug({ title: `${MODULE}.populateDestSublist`, details: `Populated ${invoices.length} destination lines` });
+            log.debug({ title: `${MODULE}.populateDestSublist`, details: `Populated ${invoices.length} destination lines for customers [${customerIds.join(',')}]` });
 
         } catch (e) {
             log.error({ title: `${MODULE}.populateDestSublist`, details: e.message || e });
@@ -468,7 +531,7 @@ define([
                 const selected = request.getSublistValue({ group: 'custpage_dest_sublist', name: 'custpage_dst_select', line: j });
                 if (selected === 'T') {
                     destLines.push({
-                        invoiceId: request.getSublistValue({ group: 'custpage_dest_sublist', name: 'custpage_dst_invoice_id', line: j }),
+                       invoiceId: request.getSublistValue({ group: 'custpage_dest_sublist', name: 'custpage_dst_invoice_id', line: j }),
                         applyAmount: request.getSublistValue({ group: 'custpage_dest_sublist', name: 'custpage_dst_amount', line: j })
                     });
                 }
@@ -551,18 +614,31 @@ define([
             // La validación del client script garantiza que ambas listas tienen
             // el mismo número de elementos antes de llegar aquí.
 
-            sourceLines.forEach((srcLine, srcIndex) => {
-                let taxInfo = { taxCodeId: '', taxRate: 0 };
-                if (srcLine.sourceInvoiceId && srcLine.sourceItemId) {
-                    taxInfo = dao.getTaxInfoFromInvoiceLine(srcLine.sourceInvoiceId, srcLine.sourceItemId);
-                }
+            // Determinar si la asignación de factura destino va directa en cada línea origen
+            // (1 a 1 o N a 1) o si requiere registros WORK de destino separados (N a M).
+            const isPositionalEstandard = isEstandardCM && (destLines.length <= 1 || sourceLines.length === destLines.length);
 
-                // Para Estándar + CM: el reduce procesa cada WORK de forma individual
-                // (key única). invoiceTo y applyAmount deben ir embebidos en el mismo
-                // registro fuente para que el CM se aplique en el mismo reduce call.
-                // Para Consolidada/Agrupación/Exceso: los registros destino van separados
-                // (el reduce los agrupa todos bajo la misma key).
-                const pairedDest = isEstandardCM ? (destLines[srcIndex] || null) : null;
+            // Pre-calcular impuestos de todas las líneas origen en una sola llamada batch
+            const taxPairsPost = sourceLines
+                .filter(s => s.sourceInvoiceId && s.sourceItemId)
+                .map(s => ({ invoiceId: s.sourceInvoiceId, itemId: s.sourceItemId, amount: parseFloat(s.amountToSettle) || 0 }));
+            const taxBatchMapPost = dao.getAllTaxDetailsBatch(taxPairsPost);
+
+            sourceLines.forEach((srcLine, srcIndex) => {
+                const allTaxDetails = taxBatchMapPost[`${srcLine.sourceInvoiceId}_${srcLine.sourceItemId}`] || [];
+
+                let pairedDest = null;
+                let pairedApplyAmount = '0';
+
+                if (isPositionalEstandard && destLines.length > 0) {
+                    if (destLines.length === 1) {
+                        pairedDest = destLines[0];
+                        pairedApplyAmount = srcLine.amountToSettle || '0';
+                    } else if (sourceLines.length === destLines.length) {
+                        pairedDest = destLines[srcIndex] || null;
+                        pairedApplyAmount = pairedDest ? (pairedDest.applyAmount || '0') : '0';
+                    }
+                }
 
                 const workData = {
                     customerId:       customerId,
@@ -577,30 +653,23 @@ define([
                     settledAmount:    srcLine.settledAmount  || '0',
                     availableAmount:  srcLine.availableAmount,
                     amountToSettle:   srcLine.amountToSettle,
-                    taxCodeId:        taxInfo.taxCodeId,
                     taxBasis:         srcLine.amountToSettle,
+                    taxDetails:       allTaxDetails,
                     excessFlag:       scenario === 'Cobro en exceso',
-                    // Estándar: origen[i] ↔ destino[i] (emparejamiento posicional)
-                    invoiceTo:   pairedDest ? pairedDest.invoiceId   || '' : '',
-                    applyAmount: pairedDest ? pairedDest.applyAmount || '0' : '0'
+                    // Estándar posicional: asignación de factura destino y monto a aplicar
+                    invoiceTo:   pairedDest ? pairedDest.invoiceId || '' : '',
+                    applyAmount: pairedApplyAmount
                 };
 
                 const workId = txnBuilder.createWorkRecord(workData, 'Suitelet');
                 workIds.push(workId);
             });
 
-            // Consolidada / Agrupación / Cobro en exceso / Específica (por SKU) + Credit Memo:
-            // crear UN registro de aplicación POR ACUERDO POR factura destino, con el applyAmount
-            // proporcional al monto que cada acuerdo aporta al total.
-            //
-            // PROBLEMA ANTERIOR: se creaba un solo WORK de destino con agreementId = firstSrc y
-            // applyAmount = total. Esto causaba que:
-            //   - Solo el acuerdo del firstSrc recibía el WORK de destino → su CM se aplicaba con monto incorrecto.
-            //   - Los demás acuerdos generaban CMs sin ninguna aplicación.
-            //
-            // FIX: agrupar sources por acuerdo, calcular proporción y crear un destination WORK por cada par
-            // (acuerdo × factura destino) con applyAmount proporcional.
-            if (settlementMethod === '3' && destLines.length > 0 && !isEstandardCM) {
+            // Si es Credit Memo y no es posicional (Consolidada/Agrupación/Específica/Exceso o Estándar N a M):
+            // crear registros WORK de destino por cada factura destino.
+            if (settlementMethod === '3' && destLines.length > 0 && !isPositionalEstandard) {
+
+                const firstSourceInvoiceId = sourceLines.length > 0 ? sourceLines[0].sourceInvoiceId : '';
 
                 // 1. Agrupar source lines por acuerdo y sumar su amountToSettle
                 const agreementAmountMap = {};
@@ -615,19 +684,23 @@ define([
                 // 2. Por cada factura destino, crear un WORK de destino por acuerdo
                 destLines.forEach((dst) => {
                     const dstApply = parseFloat(dst.applyAmount) || 0;
+                    let assignedApply = 0;
 
-                    agreementEntries.forEach(([agId, agAmount]) => {
-                        // Proporción de este acuerdo sobre el total
+                    agreementEntries.forEach(([agId, agAmount], agIndex) => {
                         const proportion = grandTotal > 0 ? agAmount / grandTotal : 1 / agreementEntries.length;
-                        const proportionalApply = Math.round(dstApply * proportion * 100) / 100;
+                        // El último acuerdo absorbe el residuo de redondeo para que la suma cuadre con dstApply
+                        const proportionalApply = agIndex === agreementEntries.length - 1
+                            ? Math.round((dstApply - assignedApply) * 100) / 100
+                            : Math.round(dstApply * proportion * 100) / 100;
+                        assignedApply += proportionalApply;
 
                         const dstWorkData = {
                             customerId:       customerId,
                             agreementId:      agId,
                             settlementMethod: settlementMethod,
                             scenario:         scenario,
-                            // Campos de fuente vacíos — este registro solo define la aplicación
-                            sourceInvoiceId:  '',
+                            // En Estándar N a M asignamos firstSourceInvoiceId para que map las agrupe por factura origen
+                            sourceInvoiceId:  isEstandardCM ? firstSourceInvoiceId : '',
                             sourceAccrualId:  '',
                             sourceItemId:     '',
                             originalAmount:   '0',
@@ -638,11 +711,12 @@ define([
                             taxCodeId:        '',
                             taxBasis:         '0',
                             excessFlag:       false,
-                            invoiceTo:    dst.invoiceId || '',
-                            applyAmount:  String(proportionalApply)
+                            invoiceTo:        dst.invoiceId,
+                            applyAmount:      proportionalApply.toString()
                         };
-                        const workId = txnBuilder.createWorkRecord(dstWorkData, 'Suitelet', { ignoreMandatoryFields: true });
-                        workIds.push(workId);
+
+                        const dstWorkId = txnBuilder.createWorkRecord(dstWorkData, 'Suitelet');
+                        workIds.push(dstWorkId);
                     });
                 });
             }
