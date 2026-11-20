@@ -27,6 +27,18 @@ define([
     const MODULE = 'giv_mr_rebate_liquidation';
 
     /**
+     * Recalcula los detalles fiscales de la línea origen sobre un nuevo neto,
+     * conservando código, tipo y tasa (hereda IVA/IEPS de la línea de factura origen).
+     */
+    const rebaseTaxDetails = (taxList, netAmount) => (taxList || []).map(td => ({
+        taxCodeId: td.taxCodeId,
+        taxRate:   parseFloat(td.taxRate) || 0,
+        taxType:   td.taxType || '',
+        taxBasis:  Math.round((parseFloat(netAmount) || 0) * 100) / 100,
+        taxAmount: Math.round(((parseFloat(netAmount) || 0) * (parseFloat(td.taxRate) || 0) / 100) * 100) / 100
+    }));
+
+    /**
      * getInputData — Busca registros WORK con estado "Capturado".
      */
     const getInputData = () => {
@@ -264,55 +276,70 @@ define([
                     }));
 
                 } else if (scenario === 'Cobro en exceso') {
-                    // Escenario 4 — Prorrateo del excedente entre líneas de fuente
-                    let totalRequested = sourceWRs.reduce((sum, wr) => sum + (parseFloat(wr.amountToSettle) || 0), 0);
-
-                    // Guardrail: Si el usuario ingresó el exceso ($95) en la factura destino (applyAmount) en lugar de la provisión
-                    const totalApply = workRecords.reduce((sum, wr) => sum + (parseFloat(wr.applyAmount) || 0), 0);
-                    if (totalApply > totalRequested) {
-                        totalRequested = totalApply;
+                    // Escenario 4 — Cobro en exceso (minuta GV 29-oct-2026):
+                    //  · 1 línea por provisión con el artículo del acuerdo por min(liquidar, disponible).
+                    //  · Excedente por línea = liquidar − disponible, acumulado por combinación de impuestos
+                    //    de la línea de factura origen → 1 línea con el artículo de excedente por cada combinación.
+                    //  · Montos netos: IVA/IEPS se calculan encima, heredados de la línea origen.
+                    //  · El excedente solo se captura en origen (validado en validator/cliente/CSV).
+                    if (!agreement || !agreement.accounting_item) {
+                        throw new Error('El acuerdo de reembolso no tiene configurado el artículo contable (custrecord_rm_accounting_item).');
                     }
 
-                    const linesForProration = sourceWRs.map(wr => ({
-                        ...wr,
-                        provisionAmount: parseFloat(wr.availableAmount) || 0  // peso = saldo disponible
-                    }));
+                    const excessGroups = {};   // taxKey → { amount, taxList }
+                    const agreementLabel = agreement.name || `Acuerdo ${agreementId}`;
 
-                    const proratedLines = validator.calculateExcessProration(linesForProration, totalRequested);
+                    enrichedWRs.forEach(wr => {
+                        const requested    = Math.round((parseFloat(wr.amountToSettle) || 0) * 100) / 100;
+                        const available    = Math.round((parseFloat(wr.availableAmount) || 0) * 100) / 100;
+                        const provisionNet = Math.round(Math.min(requested, available) * 100) / 100;
+                        const excessNet    = Math.round((requested - available) * 100) / 100;
+                        const taxList      = wr.taxDetails || [];
+                        const itemName     = wr.sourceItemName || wr.sourceItemId || '';
 
-                    cmLines = proratedLines.map(wr => {
-                        const eWr = enrichedMap[wr.workId] || wr;
-                        const itemName = wr.sourceItemName || wr.sourceItemId || '';
+                        if (provisionNet > 0) {
+                            cmLines.push({
+                                itemId:      agreement.accounting_item,
+                                amount:      provisionNet,
+                                taxCodeId:   wr.taxCodeId,
+                                taxRate:     parseFloat(wr.taxRate || 0),
+                                taxDetails:  rebaseTaxDetails(taxList, provisionNet),
+                                description: itemName || `Liquidación rebate - ${agreementLabel}`
+                            });
+                        }
 
-                        // El monto capturado en exceso es TOTAL (impuestos incluidos):
-                        // se separa el neto y se recalculan los impuestos sobre ese neto,
-                        // en lugar de usar los taxDetails calculados sobre la provisión original.
-                        const taxList = eWr.taxDetails || [];
-                        const totalRate = taxList.reduce((s, td) => s + (parseFloat(td.taxRate) || 0), 0) / 100;
-                        const estimatedNet = Math.round(wr.finalAmount / (1 + totalRate) * 100) / 100;
-                        const lineTaxDetails = taxList.map(td => ({
-                            ...td,
-                            taxAmount: Math.round(estimatedNet * (parseFloat(td.taxRate) || 0)) / 100
-                        }));
-                        const lineTaxTotal = lineTaxDetails.reduce((s, td) => s + td.taxAmount, 0);
-                        // El neto absorbe el residuo de redondeo para que neto + impuestos = finalAmount
-                        const netAmount = Math.round((wr.finalAmount - lineTaxTotal) * 100) / 100;
-                        lineTaxDetails.forEach(td => { td.taxBasis = netAmount; });
-
-                        return {
-                            itemId:      agreement.accounting_item,
-                            amount:      netAmount,
-                            taxCodeId:   wr.taxCodeId,
-                            taxRate:     parseFloat(wr.taxRate || 0),
-                            taxDetails:  lineTaxDetails,
-                            description: itemName || `Liquidación rebate (exceso) - Acuerdo ${agreementId}`
-                        };
+                        if (excessNet > 0) {
+                            const taxKey = taxList
+                                .map(td => `${td.taxCodeId || ''}@${parseFloat(td.taxRate) || 0}`)
+                                .sort()
+                                .join('|') || `tc:${wr.taxCodeId || ''}`;
+                            if (!excessGroups[taxKey]) {
+                                excessGroups[taxKey] = { amount: 0, taxList: taxList, taxCodeId: wr.taxCodeId };
+                            }
+                            excessGroups[taxKey].amount = Math.round((excessGroups[taxKey].amount + excessNet) * 100) / 100;
+                        }
                     });
 
-                    proratedLines.forEach(wr => {
-                        txnBuilder.updateWorkRecord(wr.workId, {
-                            proratedAmount: wr.finalAmount   // → custrecord_giv_lw_amt_to_settle
+                    const excessGroupList = Object.values(excessGroups);
+                    // Artículo de excedente configurado en el acuerdo (custrecord_giv_excess_item).
+                    const excessItemId = agreement.excessItem;
+                    if (excessGroupList.length && !excessItemId) {
+                        throw new Error(`El acuerdo "${agreementLabel}" no tiene configurado el artículo de Cobro en exceso (custrecord_giv_excess_item).`);
+                    }
+
+                    excessGroupList.forEach(grp => {
+                        cmLines.push({
+                            itemId:      excessItemId,
+                            amount:      grp.amount,
+                            taxCodeId:   grp.taxCodeId,
+                            taxDetails:  rebaseTaxDetails(grp.taxList, grp.amount),
+                            description: `Cobro en exceso - ${agreementLabel}`
                         });
+                    });
+
+                    log.audit({
+                        title:   `${MODULE}.reduce.excess`,
+                        details: `Cobro en exceso | Acuerdo ${agreementId} | ${enrichedWRs.length} provisiones → ${cmLines.length} líneas CM (${Object.keys(excessGroups).length} línea(s) de excedente)`
                     });
 
                 } else {
@@ -433,6 +460,12 @@ define([
                 }, 0);
                 const groupTaxRatio = groupNetTotal > 0 ? groupTaxTotal / groupNetTotal : 0;
 
+                // Cobro en exceso: proporción impuesto/neto de las líneas reales del CM
+                // (provisión + excedente), para aplicar el bruto a la factura destino.
+                const cmNetTotal = cmLines.reduce((s, l) => s + (parseFloat(l.amount) || 0), 0);
+                const cmTaxTotal = cmLines.reduce((s, l) => s + (l.taxDetails || []).reduce((ts, td) => ts + (parseFloat(td.taxAmount) || 0), 0), 0);
+                const cmTaxRatio = cmNetTotal > 0 ? cmTaxTotal / cmNetTotal : 0;
+
                 const invoiceMap = {};
                 workRecords.forEach(wr => {
                     if (!wr.invoiceTo) return;
@@ -447,7 +480,8 @@ define([
                     let lineGrossApply = netApply;
 
                     if (scenario === 'Cobro en exceso') {
-                        // En exceso el monto capturado ya incluye impuestos: se aplica tal cual
+                        // Montos netos: se agregan los impuestos con la proporción real del CM
+                        lineGrossApply = netApply * (1 + cmTaxRatio);
                     } else if (eWr.taxDetails && Array.isArray(eWr.taxDetails) && eWr.taxDetails.length > 0) {
                         // Usar taxDetails propios del WORK (fuente o destino enriquecido)
                         const baseAmount = parseFloat(eWr.amountToSettle) || netApply;
@@ -513,13 +547,7 @@ define([
             }
 
             // ── Actualizar WORK a Completado y crear History ──
-            // [FIX 2] Calcular la diferencia GLOBAL antes del loop para Cobro en exceso.
-            // DRD: la diferencia es el excedente total del lote, no una diferencia por línea individual.
-            const totalAvailableInGroup = workRecords.reduce((s, wr) => s + (parseFloat(wr.availableAmount) || 0), 0);
             const totalSettledInGroup   = workRecords.reduce((s, wr) => s + (parseFloat(wr.amountToSettle)  || 0), 0);
-            const globalDiff = scenario === 'Cobro en exceso'
-                ? Math.round((totalSettledInGroup - totalAvailableInGroup) * 100) / 100
-                : 0;
 
             workRecords.forEach(wr => {
                 txnBuilder.updateWorkRecord(wr.workId, {
@@ -547,8 +575,10 @@ define([
                     accrualAmount:          parseFloat(wr.originalAmount) || 0,
                     settledAmount:          parseFloat(wr.amountToSettle) || 0,
                     appliedAmount:          parseFloat(wr.applyAmount) || 0,
-                    // [FIX 2] globalDiff = excedente total del lote, no diferencia por línea
-                    difference:             globalDiff,
+                    // Cobro en exceso: excedente de esta línea (liquidar − disponible); resto: 0
+                    difference:             scenario === 'Cobro en exceso'
+                        ? Math.max(0, Math.round(((parseFloat(wr.amountToSettle) || 0) - (parseFloat(wr.availableAmount) || 0)) * 100) / 100)
+                        : 0,
                     taxDetailsJson:         wr.taxDetailsJson || (wr.taxDetails ? JSON.stringify(wr.taxDetails) : ''),
                     taxBasis:               parseFloat(wr.taxBasis) || 0,
                     csvBatchId:             wr.csvBatchId
